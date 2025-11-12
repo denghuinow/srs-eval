@@ -2,10 +2,11 @@
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from src.config import load_config
-from src.evaluator import Evaluator
+from src.evaluator import DocumentEvaluation, Evaluator
 from src.output_formatter import OutputFormatter
 from src.point_extractor import PointExtractor
 
@@ -51,6 +52,23 @@ def main():
         default="output",
         help="输出目录（默认：output）",
     )
+    parser.add_argument(
+        "--force-extract",
+        action="store_true",
+        help="强制重新提取要点清单（忽略缓存）",
+    )
+    parser.add_argument(
+        "--extract-runs",
+        type=int,
+        default=1,
+        help="提取要点清单的运行次数，多次提取后选择要点数量最多的结果（默认：1）",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="并行执行的最大工作线程数（默认：自动，根据任务数量调整）",
+    )
 
     args = parser.parse_args()
 
@@ -95,8 +113,27 @@ def main():
         extractor = PointExtractor(config)
         print(f"使用模型: {config.openai.model}")
         print(f"API地址: {config.openai.base_url}")
-        points = extractor.extract_points(baseline_path)
-        print(f"✓ 成功提取 {len(points)} 个要点")
+        
+        if args.force_extract:
+            print("⚠ 强制重新提取模式（忽略缓存）")
+        else:
+            print("ℹ 使用缓存机制（如果存在）")
+        
+        if args.extract_runs > 1:
+            print(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择要点数量最多的结果")
+        
+        points = extractor.extract_points(
+            baseline_path,
+            force_extract=args.force_extract,
+            extract_runs=args.extract_runs,
+        )
+        
+        # 统计检查项数量
+        total_checkpoints = sum(
+            len(point.get("checkpoints", [])) for point in points
+        )
+        
+        print(f"✓ 要点清单：{len(points)} 个要点，共 {total_checkpoints} 个检查项")
         print()
     except Exception as e:
         print(f"错误: 提取要点失败: {e}", file=sys.stderr)
@@ -115,13 +152,26 @@ def main():
         print(f"  - API地址: {config.openai.base_url}", file=sys.stderr)
         sys.exit(1)
 
-    # 评估文档
+    # 评估文档（支持并行执行）
     evaluator = Evaluator(config)
     evaluations = []
 
-    for target_path in target_paths:
-        print(f"正在评估文档: {target_path}")
-        print(f"运行次数: {runs}")
+    # 确定是否并行执行
+    parallel_eval = len(target_paths) > 1 or runs > 1
+    max_workers = args.max_workers
+    
+    if parallel_eval:
+        if max_workers is None:
+            # 自动计算：如果是批量评估，每个文档并行；如果是多次运行，并行运行
+            if len(target_paths) > 1:
+                max_workers = min(len(target_paths), 10)  # 最多10个并行
+            else:
+                max_workers = runs
+        print(f"ℹ 并行执行模式：最大工作线程数 = {max_workers}")
+        print()
+
+    def evaluate_document(target_path: Path) -> tuple[Path, DocumentEvaluation | None]:
+        """评估单个文档的函数，用于并行执行"""
         try:
             if runs > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
@@ -129,17 +179,59 @@ def main():
                 )
             else:
                 evaluation = evaluator.evaluate_single_run(points, target_path)
-
-            evaluations.append(evaluation)
-            print(
-                f"✓ 评估完成 - 完整性: {evaluation.completeness:.2f}, "
-                f"准确性: {evaluation.accuracy:.2f}, "
-                f"综合: {evaluation.comprehensive:.2f}"
-            )
-            print()
+            return (target_path, evaluation)
         except Exception as e:
-            print(f"错误: 评估失败: {e}", file=sys.stderr)
-            continue
+            print(f"错误: 评估文档 {target_path} 失败: {e}", file=sys.stderr)
+            return (target_path, None)
+
+    if parallel_eval and len(target_paths) > 1:
+        # 批量评估多个文档，并行执行
+        print(f"正在并行评估 {len(target_paths)} 个文档...")
+        print("-" * 60)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(evaluate_document, target_path): target_path
+                for target_path in target_paths
+            }
+            
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                target_path, evaluation = future.result()
+                if evaluation is not None:
+                    evaluations.append(evaluation)
+                    print(
+                        f"[{completed}/{len(target_paths)}] ✓ {target_path.name} - "
+                        f"完整性: {evaluation.completeness:.2f}, "
+                        f"准确性: {evaluation.accuracy:.2f}, "
+                        f"综合: {evaluation.comprehensive:.2f}"
+                    )
+        print()
+    else:
+        # 串行执行（单个文档或不需要并行）
+        for target_path in target_paths:
+            print(f"正在评估文档: {target_path}")
+            if runs > 1:
+                print(f"运行次数: {runs}")
+            try:
+                if runs > 1:
+                    evaluation = evaluator.evaluate_multiple_runs(
+                        points, target_path, runs=runs
+                    )
+                else:
+                    evaluation = evaluator.evaluate_single_run(points, target_path)
+
+                evaluations.append(evaluation)
+                print(
+                    f"✓ 评估完成 - 完整性: {evaluation.completeness:.2f}, "
+                    f"准确性: {evaluation.accuracy:.2f}, "
+                    f"综合: {evaluation.comprehensive:.2f}"
+                )
+                print()
+            except Exception as e:
+                print(f"错误: 评估失败: {e}", file=sys.stderr)
+                continue
 
     if not evaluations:
         print("错误: 没有成功评估任何文档", file=sys.stderr)

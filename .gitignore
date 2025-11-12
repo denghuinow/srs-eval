@@ -42,5 +42,8 @@ output/
 *.md
 !README.md
 
+# 缓存文件
+.cache/
+
 # uv
 .uv/
