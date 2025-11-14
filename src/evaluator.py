@@ -351,45 +351,32 @@ class Evaluator:
                 
                 # 解析检查项结果
                 checkpoint_results = []
-                checkpoint_results_data = eval_data.get("checkpoint_results", [])
                 
-                if checkpoint_results_data and expected_checkpoints:
-                    # 新格式：基于检查项结果
-                    # 创建检查项映射（用于匹配）
-                    checkpoint_map = {
-                        cp_data.get("checkpoint", ""): cp_data.get("passed", False)
-                        for cp_data in checkpoint_results_data
-                    }
+                if exists and expected_checkpoints:
+                    # 新格式：只输出通过的检查项索引
+                    passed_indices = eval_data.get("passed", [])
+                    # 验证索引有效性（0到len(checkpoints)-1）
+                    max_index = len(expected_checkpoints) - 1
+                    passed_indices_set = {idx for idx in passed_indices if isinstance(idx, int) and 0 <= idx <= max_index}
                     
                     # 按照要点中的检查项顺序创建结果
-                    for expected_cp in expected_checkpoints:
-                        passed = checkpoint_map.get(expected_cp, False)
-                        # 如果要点不存在，所有检查项必须为False
-                        if not exists:
-                            passed = False
+                    for index, expected_cp in enumerate(expected_checkpoints):
+                        passed = index in passed_indices_set
                         checkpoint_results.append(
                             CheckpointResult(checkpoint=expected_cp, passed=passed)
                         )
                 elif expected_checkpoints:
-                    # 如果API没有返回检查项结果，但要点有检查项，全部标记为未通过
+                    # 如果要点不存在，所有检查项必须为False
                     for expected_cp in expected_checkpoints:
                         checkpoint_results.append(
                             CheckpointResult(checkpoint=expected_cp, passed=False)
                         )
-                
-                # 向后兼容：如果没有检查项结果，尝试使用accuracy字段
-                accuracy = None
-                if not checkpoint_results and "accuracy" in eval_data:
-                    accuracy = float(eval_data.get("accuracy", 0.0))
-                    if not exists:
-                        accuracy = 0.0
                 
                 evaluations.append(
                     EvaluationResult(
                         point_id=point_id,
                         exists=exists,
                         checkpoint_results=checkpoint_results if checkpoint_results else None,
-                        accuracy=accuracy,
                         explanation=eval_data.get("explanation", ""),
                     )
                 )
