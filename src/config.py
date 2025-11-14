@@ -17,7 +17,7 @@ class OpenAIConfig(BaseModel):
         default="https://api.openai.com/v1", description="API基础URL"
     )
     temperature: float = Field(default=0.0, description="温度参数，固定为0确保可重复性")
-    max_tokens: int = Field(default=4000, description="最大token数")
+    max_tokens: Optional[int] = Field(default=None, description="最大token数，None时使用API默认值")
 
 
 class EvalConfig(BaseModel):
@@ -49,12 +49,16 @@ def load_config() -> Config:
             "OPENAI_API_KEY未设置，请在.env文件中配置或设置环境变量"
         )
 
+    # 处理 max_tokens：如果环境变量存在则使用，否则为 None（使用 API 默认值）
+    max_tokens_env = os.getenv("MAX_TOKENS")
+    max_tokens = int(max_tokens_env) if max_tokens_env else None
+
     openai_config = OpenAIConfig(
         api_key=api_key,
         model=os.getenv("OPENAI_MODEL", "gpt-4"),
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         temperature=float(os.getenv("TEMPERATURE", "0")),
-        max_tokens=int(os.getenv("MAX_TOKENS", "4000")),
+        max_tokens=max_tokens,
     )
 
     eval_config = EvalConfig(

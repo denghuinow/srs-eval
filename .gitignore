@@ -47,3 +47,4 @@ output/
 
 # uv
 .uv/
+logs/
