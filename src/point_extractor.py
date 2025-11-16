@@ -337,6 +337,7 @@ class PointExtractor:
         accumulated_text: str,
         finish_reason: str | None,
         task_name: str = "要点提取",
+        document_path: str | Path | None = None,
     ) -> tuple[str, str | None]:
         """
         当模型因为max_tokens截断时自动发送接续请求
@@ -346,18 +347,22 @@ class PointExtractor:
             accumulated_text: 当前已生成的文本
             finish_reason: 首次响应的finish_reason
             task_name: 日志中展示的任务名称
+            document_path: 文档路径（用于日志记录）
 
         Returns:
             (完整文本, 最终finish_reason)
         """
+        # 构建日志前缀，包含文件信息
+        log_prefix = f"[{Path(document_path).name}] " if document_path else ""
+        
         if finish_reason != "length":
             return accumulated_text, finish_reason
         if self.config.openai.max_continuations <= 0:
-            logger.warning(f"{task_name} 输出因max_tokens被截断，但未配置接续次数，将直接返回当前结果")
+            logger.warning(f"{log_prefix}{task_name} 输出因max_tokens被截断，但未配置接续次数，将直接返回当前结果")
             return accumulated_text, finish_reason
         base_messages = api_params.get("messages")
         if not base_messages:
-            logger.warning(f"{task_name} 输出被截断，但缺少原始消息上下文，无法自动接续")
+            logger.warning(f"{log_prefix}{task_name} 输出被截断，但缺少原始消息上下文，无法自动接续")
             return accumulated_text, finish_reason
 
         combined_text = accumulated_text
@@ -367,7 +372,7 @@ class PointExtractor:
         while finish_reason == "length" and attempt < total_attempts:
             attempt += 1
             logger.warning(
-                f"{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
+                f"{log_prefix}{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
             )
             continuation_messages = copy.deepcopy(base_messages)
             continuation_messages.append({"role": "assistant", "content": combined_text})
@@ -381,23 +386,23 @@ class PointExtractor:
             start_time = time.time()
             response = self._call_api_with_retry(continuation_params)
             elapsed = time.time() - start_time
-            logger.info(f"接续请求 #{attempt} 完成，耗时: {elapsed:.2f}秒")
+            logger.info(f"{log_prefix}接续请求 #{attempt} 完成，耗时: {elapsed:.2f}秒")
 
             if not response or not response.choices:
-                logger.warning("接续请求返回无效响应，停止继续尝试")
+                logger.warning(f"{log_prefix}接续请求返回无效响应，停止继续尝试")
                 break
 
             if hasattr(response, "usage") and response.usage:
                 usage = response.usage
                 logger.info(
-                    f"接续 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                    f"{log_prefix}接续 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
                     f"completion_tokens: {usage.completion_tokens}, "
                     f"total_tokens: {usage.total_tokens}"
                 )
 
             extra_text = response.choices[0].message.content or ""
             if not extra_text:
-                logger.warning("接续响应内容为空，停止继续尝试")
+                logger.warning(f"{log_prefix}接续响应内容为空，停止继续尝试")
                 break
 
             combined_text += extra_text
@@ -405,40 +410,46 @@ class PointExtractor:
 
         if finish_reason == "length":
             logger.warning(
-                f"{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，输出可能不完整"
+                f"{log_prefix}{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，输出可能不完整"
             )
 
         return combined_text, finish_reason
 
-    def _extract_points_single(self, content: str) -> list[str]:
+    def _extract_points_single(
+        self, content: str, document_path: str | Path | None = None
+    ) -> list[str]:
         """
         单次提取检查项清单（内部方法）
 
         Args:
             content: 文档内容
+            document_path: 文档路径（用于日志记录）
 
         Returns:
             检查项清单（平铺的checkpoints数组）
         """
+        # 构建日志前缀，包含文件信息
+        log_prefix = f"[{Path(document_path).name}] " if document_path else ""
+        
         # 加载prompt模板
         template = self._load_prompt_template("extract_points.txt")
-        logger.info("开始提取要点")
-        logger.debug(f"文档内容长度: {len(content)} 字符")
+        logger.info(f"{log_prefix}开始提取要点")
+        logger.debug(f"{log_prefix}文档内容长度: {len(content)} 字符")
 
         # 填充模板
         prompt = template.format(document_content=content)
-        logger.debug(f"完整prompt长度: {len(prompt)} 字符")
+        logger.debug(f"{log_prefix}完整prompt长度: {len(prompt)} 字符")
         # 记录完整Prompt内容
-        logger.debug("=" * 80)
-        logger.debug("完整Prompt内容:")
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
+        logger.debug(f"{log_prefix}完整Prompt内容:")
+        logger.debug(f"{log_prefix}{'=' * 80}")
         logger.debug(prompt)
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
         
         # 检查prompt长度（可选：如果太长可以截断或警告）
         # 注意：不同模型的token限制不同，这里只是简单检查字符数
         if len(prompt) > 100000:  # 大约25k tokens（粗略估计）
-            logger.warning(f"Prompt内容较长 ({len(prompt)} 字符)，可能需要较长时间处理")
+            logger.warning(f"{log_prefix}Prompt内容较长 ({len(prompt)} 字符)，可能需要较长时间处理")
 
         # 调用OpenAI API
         api_params = {
@@ -457,9 +468,9 @@ class PointExtractor:
         api_params["stream"] = self.config.openai.stream
         
         # 记录API调用参数
-        logger.info(f"调用API - 模型: {api_params['model']}, temperature: {api_params['temperature']}, "
+        logger.info(f"{log_prefix}调用API - 模型: {api_params['model']}, temperature: {api_params['temperature']}, "
                    f"max_tokens: {api_params.get('max_tokens', 'None')}")
-        logger.debug(f"API参数: {json.dumps({k: v for k, v in api_params.items() if k != 'messages'}, ensure_ascii=False)}")
+        logger.debug(f"{log_prefix}API参数: {json.dumps({k: v for k, v in api_params.items() if k != 'messages'}, ensure_ascii=False)}")
         
         # 记录请求开始时间
         start_time = time.time()
@@ -469,23 +480,23 @@ class PointExtractor:
             response = self._call_api_with_retry(api_params)
         except ValueError as e:
             # 重试机制已经记录了详细错误信息
-            logger.debug(f"API调用失败详情:", exc_info=True)
+            logger.debug(f"{log_prefix}API调用失败详情:", exc_info=True)
             raise
         
         # 记录响应时间
         elapsed_time = time.time() - start_time
-        logger.info(f"API调用完成，耗时: {elapsed_time:.2f}秒")
+        logger.info(f"{log_prefix}API调用完成，耗时: {elapsed_time:.2f}秒")
 
         # 检查响应
         if not response or not response.choices:
-            logger.error(f"API返回无效响应")
-            logger.debug(f"API返回无效响应详情: {response}")
+            logger.error(f"{log_prefix}API返回无效响应")
+            logger.debug(f"{log_prefix}API返回无效响应详情: {response}")
             raise ValueError(f"API返回无效响应: {response}")
 
         # 记录token使用情况
         if hasattr(response, "usage") and response.usage:
             usage = response.usage
-            logger.info(f"Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+            logger.info(f"{log_prefix}Token使用 - prompt_tokens: {usage.prompt_tokens}, "
                        f"completion_tokens: {usage.completion_tokens}, "
                        f"total_tokens: {usage.total_tokens}")
 
@@ -495,35 +506,35 @@ class PointExtractor:
         if not result_text:
             # 尝试获取更多信息
             error_msg = f"API返回结果为空"
-            logger.error(error_msg)
-            logger.debug(f"API返回结果为空详情。响应对象: {response}")
+            logger.error(f"{log_prefix}{error_msg}")
+            logger.debug(f"{log_prefix}API返回结果为空详情。响应对象: {response}")
             if hasattr(response, "error"):
-                logger.debug(f"错误信息: {response.error}")
+                logger.debug(f"{log_prefix}错误信息: {response.error}")
             raise ValueError(error_msg)
 
         # 如因max_tokens截断则自动请求接续
         result_text, _ = self._continue_on_truncation(
-            api_params, result_text, finish_reason, task_name="要点提取"
+            api_params, result_text, finish_reason, task_name="要点提取", document_path=document_path
         )
 
         # 记录原始响应
-        logger.debug(f"原始响应长度: {len(result_text)} 字符")
+        logger.debug(f"{log_prefix}原始响应长度: {len(result_text)} 字符")
         # 记录完整原始响应内容
-        logger.debug("=" * 80)
-        logger.debug("完整原始响应内容:")
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
+        logger.debug(f"{log_prefix}完整原始响应内容:")
+        logger.debug(f"{log_prefix}{'=' * 80}")
         logger.debug(result_text)
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
 
         # 清理文本：移除markdown代码块标记（如果有）
         cleaned_text = self._clean_text_output(result_text)
-        logger.debug(f"清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
+        logger.debug(f"{log_prefix}清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
         # 记录完整清理后文本内容
-        logger.debug("=" * 80)
-        logger.debug("完整清理后文本内容:")
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
+        logger.debug(f"{log_prefix}完整清理后文本内容:")
+        logger.debug(f"{log_prefix}{'=' * 80}")
         logger.debug(cleaned_text)
-        logger.debug("=" * 80)
+        logger.debug(f"{log_prefix}{'=' * 80}")
 
         try:
             # 按行解析检查项
@@ -543,21 +554,21 @@ class PointExtractor:
                 checkpoints.append(line)
             
             if not checkpoints:
-                logger.error("未提取到任何检查项")
+                logger.error(f"{log_prefix}未提取到任何检查项")
                 raise ValueError("未提取到任何检查项")
             
-            logger.info(f"成功解析文本，提取到 {len(checkpoints)} 个检查项")
+            logger.info(f"{log_prefix}成功解析文本，提取到 {len(checkpoints)} 个检查项")
             return checkpoints
         except Exception as e:
             # 提供更详细的错误信息
             error_preview = result_text[:500] if len(result_text) > 500 else result_text
             cleaned_preview = cleaned_text[:500] if len(cleaned_text) > 500 else cleaned_text
-            logger.error(f"解析文本失败: {e}")
-            logger.debug(f"解析文本失败详情:", exc_info=True)
-            logger.debug(f"原始响应（前500字符）: {error_preview}")
-            logger.debug(f"清理后文本（前500字符）: {cleaned_preview}")
-            logger.debug(f"原始响应完整长度: {len(result_text)} 字符")
-            logger.debug(f"清理后文本完整长度: {len(cleaned_text)} 字符")
+            logger.error(f"{log_prefix}解析文本失败: {e}")
+            logger.debug(f"{log_prefix}解析文本失败详情:", exc_info=True)
+            logger.debug(f"{log_prefix}原始响应（前500字符）: {error_preview}")
+            logger.debug(f"{log_prefix}清理后文本（前500字符）: {cleaned_preview}")
+            logger.debug(f"{log_prefix}原始响应完整长度: {len(result_text)} 字符")
+            logger.debug(f"{log_prefix}清理后文本完整长度: {len(cleaned_text)} 字符")
             # 异常消息只包含简短信息，详细内容已在日志文件中记录
             raise ValueError(f"解析文本失败: {e} (详细内容请查看日志文件)")
 
@@ -598,7 +609,7 @@ class PointExtractor:
         logger.info(f"开始提取检查项，文档: {document_path}, 提取次数: {extract_runs}, 强制提取: {force_extract}")
         if extract_runs <= 1:
             # 单次提取
-            checkpoints = self._extract_points_single(content)
+            checkpoints = self._extract_points_single(content, document_path=document_path)
             logger.info(f"✓ 成功提取 {len(checkpoints)} 个检查项")
         else:
             # 多次提取，并行执行，选择检查项数量最多的结果
@@ -608,7 +619,7 @@ class PointExtractor:
             def extract_with_index(i: int) -> tuple[int, list[str]]:
                 """带索引的提取函数，用于并行执行"""
                 try:
-                    checkpoints = self._extract_points_single(content)
+                    checkpoints = self._extract_points_single(content, document_path=document_path)
                     return (i, checkpoints)
                 except Exception as e:
                     logger.error(f"  第 {i+1}/{extract_runs} 次提取失败: {e}")
