@@ -487,9 +487,21 @@ class Evaluator:
         # 加载prompt模板
         template = self._load_prompt_template("evaluate_points.txt")
 
+        # 去除检查项中的重复项（保持顺序）
+        original_count = len(checkpoints)
+        seen = set()
+        unique_checkpoints = []
+        for checkpoint in checkpoints:
+            if checkpoint not in seen:
+                seen.add(checkpoint)
+                unique_checkpoints.append(checkpoint)
+        
+        if original_count != len(unique_checkpoints):
+            logger.info(f"去重前检查项数量: {original_count}, 去重后: {len(unique_checkpoints)} (已去除 {original_count - len(unique_checkpoints)} 个重复项)")
+        
         # 准备检查项CSV表格
-        checkpoints_table = self._format_checkpoints_as_csv(checkpoints)
-        logger.debug(f"检查项数量: {len(checkpoints)}, CSV长度: {len(checkpoints_table)} 字符")
+        checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints)
+        logger.debug(f"检查项数量: {len(unique_checkpoints)}, CSV长度: {len(checkpoints_table)} 字符")
 
         # 填充模板
         prompt = template.format(
@@ -589,15 +601,15 @@ class Evaluator:
 
         try:
             # 解析CSV格式的结果
-            checkpoint_results = self._parse_csv_result(cleaned_text, checkpoints)
+            checkpoint_results = self._parse_csv_result(cleaned_text, unique_checkpoints)
             
             # 统计通过的检查项数量
             total_passed = sum(1 for cp in checkpoint_results if cp.passed)
-            logger.info(f"成功解析CSV，共 {total_passed} 个通过的检查项（共 {len(checkpoints)} 个检查项）")
+            logger.info(f"成功解析CSV，共 {total_passed} 个通过的检查项（共 {len(unique_checkpoints)} 个检查项）")
 
             evaluation = DocumentEvaluation(
                 target_document=str(target_document_path),
-                checkpoints=checkpoints,
+                checkpoints=unique_checkpoints,
                 checkpoint_results=checkpoint_results,
             )
             logger.info(f"评估完成 - 准确性: {evaluation.accuracy:.2f}, "
