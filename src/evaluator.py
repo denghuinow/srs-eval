@@ -1,5 +1,6 @@
 """评估模块"""
 
+import copy
 import csv
 import io
 import json
@@ -18,6 +19,9 @@ from src.document_parser import DocumentParser
 
 # 配置日志
 logger = logging.getLogger(__name__)
+CONTINUATION_PROMPT = (
+    "上次回答因为达到 max_tokens 限制被截断。请从中断处继续完整输出剩余内容，保持完全一致的格式，不要重复已经输出的内容。"
+)
 
 
 class MergeStrategy(str, Enum):
@@ -390,6 +394,76 @@ class Evaluator:
         if last_exception:
             raise ValueError(f"API调用失败: {last_exception}")
 
+    def _continue_on_truncation(
+        self,
+        api_params: dict[str, Any],
+        accumulated_text: str,
+        finish_reason: str | None,
+        task_name: str = "文档评估",
+    ) -> tuple[str, str | None]:
+        """
+        如果模型因为达到max_tokens而提前结束，自动请求接续
+        """
+        if finish_reason != "length":
+            return accumulated_text, finish_reason
+        if self.config.openai.max_continuations <= 0:
+            logger.warning(f"{task_name} 输出因max_tokens被截断，但未开启接续功能")
+            return accumulated_text, finish_reason
+        base_messages = api_params.get("messages")
+        if not base_messages:
+            logger.warning(f"{task_name} 输出被截断，但缺少原始消息上下文，无法接续")
+            return accumulated_text, finish_reason
+
+        combined_text = accumulated_text
+        attempt = 0
+        total_attempts = self.config.openai.max_continuations
+
+        while finish_reason == "length" and attempt < total_attempts:
+            attempt += 1
+            logger.warning(
+                f"{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
+            )
+            continuation_messages = copy.deepcopy(base_messages)
+            continuation_messages.append({"role": "assistant", "content": combined_text})
+            continuation_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+
+            continuation_params = {
+                k: v for k, v in api_params.items() if k != "messages"
+            }
+            continuation_params["messages"] = continuation_messages
+
+            start_time = time.time()
+            response = self._call_api_with_retry(continuation_params)
+            elapsed = time.time() - start_time
+            logger.info(f"接续请求 #{attempt} 完成，耗时: {elapsed:.2f}秒")
+
+            if not response or not response.choices:
+                logger.warning("接续请求返回无效响应，停止继续尝试")
+                break
+
+            if hasattr(response, "usage") and response.usage:
+                usage = response.usage
+                logger.info(
+                    f"接续 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                    f"completion_tokens: {usage.completion_tokens}, "
+                    f"total_tokens: {usage.total_tokens}"
+                )
+
+            extra_text = response.choices[0].message.content or ""
+            if not extra_text:
+                logger.warning("接续响应为空，停止继续尝试")
+                break
+
+            combined_text += extra_text
+            finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "length":
+            logger.warning(
+                f"{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，输出可能不完整"
+            )
+
+        return combined_text, finish_reason
+
     def evaluate_single_run(
         self,
         checkpoints: list[str],
@@ -481,6 +555,7 @@ class Evaluator:
 
         # 解析响应
         result_text = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
         if not result_text:
             # 尝试获取更多信息
             error_msg = f"API返回结果为空"
@@ -489,6 +564,9 @@ class Evaluator:
             if hasattr(response, "error"):
                 logger.debug(f"错误信息: {response.error}")
             raise ValueError(error_msg)
+        result_text, _ = self._continue_on_truncation(
+            api_params, result_text, finish_reason, task_name="文档评估"
+        )
 
         # 记录原始响应
         logger.debug(f"原始响应长度: {len(result_text)} 字符")
@@ -1011,4 +1089,3 @@ class Evaluator:
             # 默认使用平均值
             passed = pass_ratio >= 0.5
             return pass_ratio, passed
-

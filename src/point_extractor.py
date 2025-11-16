@@ -1,5 +1,6 @@
 """要点提取模块"""
 
+import copy
 import hashlib
 import json
 import logging
@@ -15,6 +16,9 @@ from src.document_parser import DocumentParser
 
 # 配置日志
 logger = logging.getLogger(__name__)
+CONTINUATION_PROMPT = (
+    "上次回答因为达到 max_tokens 限制被截断。请从中断处继续完整输出剩余内容，保持相同的结构和格式，不要重复已经输出的内容。"
+)
 
 
 class PointExtractor:
@@ -327,6 +331,85 @@ class PointExtractor:
         if last_exception:
             raise ValueError(f"API调用失败: {last_exception}")
 
+    def _continue_on_truncation(
+        self,
+        api_params: dict[str, Any],
+        accumulated_text: str,
+        finish_reason: str | None,
+        task_name: str = "要点提取",
+    ) -> tuple[str, str | None]:
+        """
+        当模型因为max_tokens截断时自动发送接续请求
+
+        Args:
+            api_params: 首次请求的参数（用于构造后续messages）
+            accumulated_text: 当前已生成的文本
+            finish_reason: 首次响应的finish_reason
+            task_name: 日志中展示的任务名称
+
+        Returns:
+            (完整文本, 最终finish_reason)
+        """
+        if finish_reason != "length":
+            return accumulated_text, finish_reason
+        if self.config.openai.max_continuations <= 0:
+            logger.warning(f"{task_name} 输出因max_tokens被截断，但未配置接续次数，将直接返回当前结果")
+            return accumulated_text, finish_reason
+        base_messages = api_params.get("messages")
+        if not base_messages:
+            logger.warning(f"{task_name} 输出被截断，但缺少原始消息上下文，无法自动接续")
+            return accumulated_text, finish_reason
+
+        combined_text = accumulated_text
+        total_attempts = self.config.openai.max_continuations
+        attempt = 0
+
+        while finish_reason == "length" and attempt < total_attempts:
+            attempt += 1
+            logger.warning(
+                f"{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
+            )
+            continuation_messages = copy.deepcopy(base_messages)
+            continuation_messages.append({"role": "assistant", "content": combined_text})
+            continuation_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+
+            continuation_params = {
+                k: v for k, v in api_params.items() if k != "messages"
+            }
+            continuation_params["messages"] = continuation_messages
+
+            start_time = time.time()
+            response = self._call_api_with_retry(continuation_params)
+            elapsed = time.time() - start_time
+            logger.info(f"接续请求 #{attempt} 完成，耗时: {elapsed:.2f}秒")
+
+            if not response or not response.choices:
+                logger.warning("接续请求返回无效响应，停止继续尝试")
+                break
+
+            if hasattr(response, "usage") and response.usage:
+                usage = response.usage
+                logger.info(
+                    f"接续 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                    f"completion_tokens: {usage.completion_tokens}, "
+                    f"total_tokens: {usage.total_tokens}"
+                )
+
+            extra_text = response.choices[0].message.content or ""
+            if not extra_text:
+                logger.warning("接续响应内容为空，停止继续尝试")
+                break
+
+            combined_text += extra_text
+            finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "length":
+            logger.warning(
+                f"{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，输出可能不完整"
+            )
+
+        return combined_text, finish_reason
+
     def _extract_points_single(self, content: str) -> list[str]:
         """
         单次提取检查项清单（内部方法）
@@ -408,6 +491,7 @@ class PointExtractor:
 
         # 解析响应
         result_text = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
         if not result_text:
             # 尝试获取更多信息
             error_msg = f"API返回结果为空"
@@ -416,6 +500,11 @@ class PointExtractor:
             if hasattr(response, "error"):
                 logger.debug(f"错误信息: {response.error}")
             raise ValueError(error_msg)
+
+        # 如因max_tokens截断则自动请求接续
+        result_text, _ = self._continue_on_truncation(
+            api_params, result_text, finish_reason, task_name="要点提取"
+        )
 
         # 记录原始响应
         logger.debug(f"原始响应长度: {len(result_text)} 字符")
@@ -559,4 +648,3 @@ class PointExtractor:
         logger.info(f"✓ 检查项清单已保存到缓存: {cache_path}")
         
         return checkpoints
-

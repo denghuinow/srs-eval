@@ -22,6 +22,9 @@ class OpenAIConfig(BaseModel):
     max_retries: int = Field(default=3, description="最大重试次数")
     retry_delay: float = Field(default=1.0, description="重试延迟初始值（秒），使用指数退避")
     stream: bool = Field(default=True, description="是否启用流式响应")
+    max_continuations: int = Field(
+        default=2, description="当因max_tokens导致输出被截断时自动请求接续的次数上限"
+    )
 
 
 class EvalConfig(BaseModel):
@@ -56,6 +59,9 @@ def load_config() -> Config:
     # 处理 max_tokens：如果环境变量存在则使用，否则为 None（使用 API 默认值）
     max_tokens_env = os.getenv("MAX_TOKENS")
     max_tokens = int(max_tokens_env) if max_tokens_env else None
+    max_continuations = int(os.getenv("MAX_CONTINUATIONS", "2"))
+    if max_continuations < 0:
+        max_continuations = 0
 
     openai_config = OpenAIConfig(
         api_key=api_key,
@@ -67,6 +73,7 @@ def load_config() -> Config:
         max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
         retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
         stream=os.getenv("OPENAI_STREAM", "true").lower() in ("true", "1", "yes"),
+        max_continuations=max_continuations,
     )
 
     eval_config = EvalConfig(
@@ -76,4 +83,3 @@ def load_config() -> Config:
     )
 
     return Config(openai=openai_config, eval=eval_config)
-
