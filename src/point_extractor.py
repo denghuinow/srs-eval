@@ -361,10 +361,6 @@ class PointExtractor:
         api_params = {
             "model": self.config.openai.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a professional requirements document analysis expert. Strictly follow the requirements for output, one checkpoint per line, without any other explanatory text.",
-                },
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.config.openai.temperature,

@@ -434,10 +434,6 @@ class Evaluator:
         api_params = {
             "model": self.config.openai.model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a professional requirements document evaluation expert. You must wrap CSV format output in ```csv code blocks, each line must contain three columns: Index,Reason,Result. The third column Result must be yes or no, absolutely cannot be omitted. Do not output any other text or comments outside the code blocks.",
-                },
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.config.openai.temperature,
