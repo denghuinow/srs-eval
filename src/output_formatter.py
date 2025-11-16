@@ -22,24 +22,13 @@ class OutputFormatter:
         Returns:
             JSON格式的字典
         """
-        evaluations_data = []
-        for e in evaluation.evaluations:
-            eval_data = {
-                "point_id": e.point_id,
-                "exists": e.exists,
-                "accuracy": round(e.accuracy, 2),
-                "explanation": e.explanation,
+        checkpoint_results_data = [
+            {
+                "checkpoint": cp.checkpoint,
+                "passed": cp.passed,
             }
-            # 如果有检查项结果，添加到输出中
-            if e.checkpoint_results:
-                eval_data["checkpoint_results"] = [
-                    {
-                        "checkpoint": cp.checkpoint,
-                        "passed": cp.passed,
-                    }
-                    for cp in e.checkpoint_results
-                ]
-            evaluations_data.append(eval_data)
+            for cp in evaluation.checkpoint_results
+        ]
 
         return {
             "target_document": evaluation.target_document,
@@ -48,8 +37,8 @@ class OutputFormatter:
                 "accuracy": round(evaluation.accuracy, 2),
                 "comprehensive": round(evaluation.comprehensive, 2),
             },
-            "points": evaluation.points,
-            "evaluations": evaluations_data,
+            "checkpoints": evaluation.checkpoints,
+            "checkpoint_results": checkpoint_results_data,
         }
 
     @staticmethod
@@ -129,57 +118,19 @@ class OutputFormatter:
         lines.append(f"| 综合分数 | {evaluation.comprehensive:.2f} |")
         lines.append("")
 
-        # 要点清单
-        lines.append("## 要点清单\n")
-        for point in evaluation.points:
-            level = point.get("level", 1)
-            indent = "  " * (level - 1)
-            title = point.get("title", "")
-            description = point.get("description", "")
-            point_id = point.get("id", "")
-            lines.append(f"{indent}- **{point_id} {title}**")
-            if description:
-                lines.append(f"{indent}  {description}")
-        lines.append("")
-
-        # 详细评估结果
-        lines.append("## 详细评估结果\n")
-        lines.append("| 要点ID | 存在 | 准确性 | 说明 |")
-        lines.append("|--------|------|--------|------|")
-        for eval_result in evaluation.evaluations:
-            exists_str = "✓" if eval_result.exists else "✗"
-            lines.append(
-                f"| {eval_result.point_id} | {exists_str} | "
-                f"{eval_result.accuracy:.2f} | {eval_result.explanation} |"
-            )
+        # 检查项清单
+        lines.append("## 检查项清单\n")
+        lines.append(f"共 {len(evaluation.checkpoints)} 个检查项\n")
         lines.append("")
 
         # 检查项详细结果
-        has_checkpoints = any(
-            e.checkpoint_results for e in evaluation.evaluations
-        )
-        if has_checkpoints:
-            lines.append("## 检查项详细结果\n")
-            for eval_result in evaluation.evaluations:
-                if eval_result.checkpoint_results:
-                    # 找到对应的要点信息
-                    point = next(
-                        (
-                            p
-                            for p in evaluation.points
-                            if p.get("id") == eval_result.point_id
-                        ),
-                        None,
-                    )
-                    point_title = point.get("title", eval_result.point_id) if point else eval_result.point_id
-                    
-                    lines.append(f"### 要点 {eval_result.point_id}: {point_title}\n")
-                    lines.append("| 检查项 | 状态 |")
-                    lines.append("|--------|------|")
-                    for cp in eval_result.checkpoint_results:
-                        status_str = "✓ 通过" if cp.passed else "✗ 未通过"
-                        lines.append(f"| {cp.checkpoint} | {status_str} |")
-                    lines.append("")
+        lines.append("## 检查项详细结果\n")
+        lines.append("| 索引 | 检查项 | 状态 |")
+        lines.append("|------|--------|------|")
+        for index, cp_result in enumerate(evaluation.checkpoint_results):
+            status_str = "✓ 通过" if cp_result.passed else "✗ 未通过"
+            lines.append(f"| {index} | {cp_result.checkpoint} | {status_str} |")
+        lines.append("")
 
         return "\n".join(lines)
 

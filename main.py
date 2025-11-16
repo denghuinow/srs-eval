@@ -106,6 +106,13 @@ def setup_logging():
         # 不输出到控制台，只在文件中记录
         logger.debug("日志仅输出到控制台（设置LOG_FILE环境变量可同时输出到文件）")
     
+    # 禁用第三方库的详细日志（只显示WARNING及以上级别）
+    # 这些库会产生大量DEBUG和INFO级别的HTTP请求日志
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    
     return logger
 
 logger = setup_logging()
@@ -161,7 +168,7 @@ def main():
         "--extract-runs",
         type=int,
         default=1,
-        help="提取要点清单的运行次数，多次提取后选择要点数量最多的结果（默认：1）",
+        help="提取要点清单的运行次数，多次提取后选择检查项数量最多的结果（默认：1）",
     )
     parser.add_argument(
         "--max-workers",
@@ -220,20 +227,15 @@ def main():
             logger.info("ℹ 使用缓存机制（如果存在）")
         
         if args.extract_runs > 1:
-            logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择要点数量最多的结果")
+            logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择检查项数量最多的结果")
         
-        points = extractor.extract_points(
+        checkpoints = extractor.extract_points(
             baseline_path,
             force_extract=args.force_extract,
             extract_runs=args.extract_runs,
         )
         
-        # 统计检查项数量
-        total_checkpoints = sum(
-            len(point.get("checkpoints", [])) for point in points
-        )
-        
-        logger.info(f"✓ 要点清单：{len(points)} 个要点，共 {total_checkpoints} 个检查项")
+        logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
         logger.info("")
     except Exception as e:
         logger.error(f"提取要点失败: {e}")
@@ -275,10 +277,10 @@ def main():
         try:
             if judges > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
-                    points, target_path, runs=judges
+                    checkpoints, target_path, runs=judges
                 )
             else:
-                evaluation = evaluator.evaluate_single_run(points, target_path)
+                evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
             return (target_path, evaluation)
         except Exception as e:
             logger.error(f"评估文档 {target_path} 失败: {e}")
@@ -318,10 +320,10 @@ def main():
             try:
                 if judges > 1:
                     evaluation = evaluator.evaluate_multiple_runs(
-                        points, target_path, runs=judges
+                        checkpoints, target_path, runs=judges
                     )
                 else:
-                    evaluation = evaluator.evaluate_single_run(points, target_path)
+                    evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
 
                 evaluations.append(evaluation)
                 logger.info(

@@ -1,5 +1,7 @@
 """评估模块"""
 
+import csv
+import io
 import json
 import logging
 import statistics
@@ -9,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
@@ -46,32 +48,6 @@ class CheckpointResult:
             self.pass_rate = 1.0 if passed else 0.0
 
 
-class EvaluationResult:
-    """单次评估结果"""
-
-    def __init__(
-        self,
-        point_id: str,
-        exists: bool,
-        checkpoint_results: list[CheckpointResult] | None = None,
-        accuracy: float | None = None,  # 向后兼容，如果提供则使用，否则从checkpoint_results计算
-        explanation: str = "",
-    ):
-        self.point_id = point_id
-        self.exists = exists
-        self.checkpoint_results = checkpoint_results or []
-        self.explanation = explanation
-
-        # 计算准确性：如果提供了accuracy则使用，否则基于检查项通过率计算
-        if accuracy is not None:
-            self.accuracy = accuracy
-        elif self.checkpoint_results:
-            passed_count = sum(1 for cp in self.checkpoint_results if cp.passed)
-            total_count = len(self.checkpoint_results)
-            self.accuracy = (passed_count / total_count) if total_count > 0 else 0.0
-        else:
-            # 向后兼容：如果没有检查项结果，使用默认值
-            self.accuracy = 0.0
 
 
 class DocumentEvaluation:
@@ -80,57 +56,29 @@ class DocumentEvaluation:
     def __init__(
         self,
         target_document: str,
-        points: list[dict[str, Any]],
-        evaluations: list[EvaluationResult],
+        checkpoints: list[str],
+        checkpoint_results: list[CheckpointResult],
     ):
         self.target_document = target_document
-        self.points = points
-        self.evaluations = evaluations
+        self.checkpoints = checkpoints
+        self.checkpoint_results = checkpoint_results
 
         # 计算分数
-        total_points = len(points)
-        if total_points == 0:
+        total_checkpoints = len(checkpoints)
+        if total_checkpoints == 0:
             self.completeness = 0.0
             self.accuracy = 0.0
             self.comprehensive = 0.0
         else:
-            # 完整性：存在的要点数 / 总要点数
-            existing_count = sum(1 for e in evaluations if e.exists)
-            self.completeness = (existing_count / total_points) * 100
-
             # 准确性：基于检查项通过情况计算
-            # 方法1：如果有点的检查项，计算所有检查项的通过情况
-            total_checkpoints = 0
-            passed_checkpoints = 0
-            for point in points:
-                point_id = point.get("id", "")
-                # 找到对应的评估结果
-                eval_result = next(
-                    (e for e in evaluations if e.point_id == point_id), None
-                )
-                if eval_result:
-                    checkpoints = point.get("checkpoints", [])
-                    total_checkpoints += len(checkpoints)
-                    if eval_result.checkpoint_results:
-                        # 使用passed判断（是否通过）来计算准确性，这样不同策略会产生不同结果
-                        passed_checkpoints += sum(
-                            1 if cp.passed else 0 for cp in eval_result.checkpoint_results
-                        )
-                    else:
-                        # 向后兼容：如果没有检查项结果，使用accuracy字段
-                        passed_checkpoints += eval_result.accuracy * len(checkpoints)
+            passed_checkpoints = sum(1 for cp in checkpoint_results if cp.passed)
+            self.accuracy = (passed_checkpoints / total_checkpoints) * 100 if total_checkpoints > 0 else 0.0
 
-            if total_checkpoints > 0:
-                self.accuracy = (passed_checkpoints / total_checkpoints) * 100
-            else:
-                # 向后兼容：如果没有检查项，使用旧的准确性计算方法
-                accuracy_sum = sum(e.accuracy for e in evaluations)
-                self.accuracy = (accuracy_sum / total_points) * 100
+            # 完整性：与准确性相同（因为不再有points层级）
+            self.completeness = self.accuracy
 
-            # 综合分数：完整性 × 0.5 + 准确性 × 0.5
-            self.comprehensive = (
-                self.completeness * 0.5 + self.accuracy * 0.5
-            )
+            # 综合分数：完整性 × 0.5 + 准确性 × 0.5（实际上两者相同）
+            self.comprehensive = self.accuracy
 
 
 class Evaluator:
@@ -147,33 +95,38 @@ class Evaluator:
         self.client = OpenAI(
             api_key=self.config.openai.api_key,
             base_url=self.config.openai.base_url,
+            timeout=self.config.openai.timeout,
         )
         self.parser = DocumentParser()
 
     @staticmethod
-    def _extract_json_from_markdown(text: str) -> str:
+    def _extract_text_from_markdown(text: str) -> str:
         """
-        从markdown代码块中提取JSON内容
+        从markdown代码块中提取文本内容
         
         处理以下情况：
-        - ```json ... ```
+        - ```csv ... ```
         - ``` ... ```
-        - 纯JSON（无代码块标记）
+        - 纯文本（无代码块标记）
         
         Args:
             text: 可能包含markdown代码块的文本
             
         Returns:
-            清理后的JSON文本
+            清理后的文本
         """
+        # 处理 None 或空值的情况
+        if text is None:
+            return ""
+        
         text = text.strip()
         
-        # 尝试匹配 ```json ... ``` 或 ``` ... ```
+        # 尝试匹配 ```csv ... ``` 或 ``` ... ```
         if text.startswith("```"):
             # 找到第一个换行符（代码块开始标记之后）
             first_newline = text.find("\n")
             if first_newline != -1:
-                # 移除开始标记（```json 或 ```）
+                # 移除开始标记（```csv 或 ```）
                 text = text[first_newline + 1:]
             
             # 找到最后一个 ```（代码块结束标记）
@@ -183,6 +136,116 @@ class Evaluator:
                 text = text[:last_code_block]
         
         return text.strip()
+    
+    @staticmethod
+    def _format_checkpoints_as_csv(checkpoints: list[str]) -> str:
+        """
+        将检查项列表格式化为CSV表格
+        
+        Args:
+            checkpoints: 检查项列表
+            
+        Returns:
+            CSV格式的字符串，包含表头：索引编号,检查项内容
+        """
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # 写入表头
+        writer.writerow(["Index", "Checkpoint"])
+        
+        # 写入数据行
+        for index, checkpoint in enumerate(checkpoints):
+            writer.writerow([index, checkpoint])
+        
+        return output.getvalue()
+    
+    @staticmethod
+    def _parse_csv_result(csv_text: str, checkpoints: list[str]) -> list[CheckpointResult]:
+        """
+        解析CSV格式的评估结果
+
+        Args:
+            csv_text: CSV格式的文本
+            checkpoints: 检查项列表（用于验证索引）
+
+        Returns:
+            检查项结果列表
+        """
+        # 处理 None 或空值的情况
+        if csv_text is None:
+            csv_text = ""
+        
+        # 使用csv模块解析
+        reader = csv.DictReader(io.StringIO(csv_text))
+
+        # 构建索引到结果的映射
+        index_to_result = {}
+        missing_result_count = 0
+        for row in reader:
+            try:
+                index = int(row.get("Index", row.get("索引编号", -1)))
+                result_str_raw = row.get("Result", row.get("判定结果", ""))
+                result_str = (result_str_raw or "").strip().lower()
+                
+                # 如果判定结果列为空，尝试从判定理由列末尾提取
+                if not result_str or result_str in ["Reason", "判定理由"]:
+                    reason_str = row.get("Reason", row.get("判定理由", ""))
+                    if reason_str:
+                        # 尝试从判定理由末尾提取 yes/no
+                        reason_lower = reason_str.strip().lower()
+                        # 检查是否以 yes/no 结尾（可能用逗号分隔）
+                        if reason_lower.endswith(",yes") or reason_lower.endswith(" yes"):
+                            result_str = "yes"
+                        elif reason_lower.endswith(",no") or reason_lower.endswith(" no"):
+                            result_str = "no"
+                        elif reason_lower.endswith("yes"):
+                            result_str = "yes"
+                        elif reason_lower.endswith("no"):
+                            result_str = "no"
+                    
+                    # 如果仍然没有找到，记录警告
+                    if not result_str or result_str in ["Reason", "判定理由"]:
+                        missing_result_count += 1
+                        if missing_result_count <= 3:  # 只记录前3个，避免日志过多
+                            logger.warning(
+                                f"检查项 {index} 的判定结果列缺失或格式错误: "
+                                f"期望 'yes' 或 'no'，实际得到 '{row.get('Result', row.get('判定结果', ''))}'。"
+                                f"整行内容: {row}"
+                            )
+                        # 如果判定结果列缺失或格式错误，默认判定为未通过
+                        passed = False
+                    else:
+                        # 成功从判定理由中提取，记录调试信息
+                        logger.debug(f"检查项 {index} 从判定理由中提取到判定结果: {result_str}")
+                        passed = result_str in ["y", "yes", "true", "1", "是"]
+                else:
+                    passed = result_str in ["y", "yes", "true", "1", "是"]
+
+                # 验证索引有效性
+                if 0 <= index < len(checkpoints):
+                    index_to_result[index] = passed
+            except (ValueError, KeyError) as e:
+                logger.warning(f"解析CSV行失败: {row}, 错误: {e}")
+                continue
+        
+        # 如果发现大量缺失的判定结果，给出警告
+        if missing_result_count > 0:
+            logger.warning(
+                f"警告: 发现 {missing_result_count} 个检查项的判定结果列缺失或格式错误。"
+                f"这些检查项将被默认判定为未通过。"
+                f"请检查API返回的CSV格式是否正确，应包含三列：Index,Reason,Result (或 索引编号,判定理由,判定结果)"
+            )
+
+        # 构建检查项结果列表
+        checkpoint_results = []
+        for index, checkpoint in enumerate(checkpoints):
+            passed = index_to_result.get(index, False)
+            checkpoint_results.append(
+                CheckpointResult(checkpoint=checkpoint, passed=passed)
+            )
+
+        return checkpoint_results
 
     def _load_prompt_template(self, template_name: str) -> str:
         """
@@ -201,16 +264,142 @@ class Evaluator:
             raise FileNotFoundError(f"模板文件不存在: {template_path}")
         return template_path.read_text(encoding="utf-8")
 
+    def _call_api_with_retry(self, api_params: dict[str, Any]) -> Any:
+        """
+        带重试机制的API调用方法
+        
+        Args:
+            api_params: API调用参数
+            
+        Returns:
+            API响应对象（如果是流式响应，则返回收集后的完整响应）
+            
+        Raises:
+            ValueError: 所有重试都失败后抛出异常
+        """
+        max_retries = self.config.openai.max_retries
+        retry_delay = self.config.openai.retry_delay
+        last_exception = None
+        stream = api_params.get("stream", False)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    # 指数退避：延迟时间 = 初始延迟 * 2^(attempt-1)
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    logger.warning(f"第 {attempt + 1}/{max_retries + 1} 次尝试，等待 {delay:.1f} 秒后重试...")
+                    time.sleep(delay)
+                
+                response = self.client.chat.completions.create(**api_params)
+                
+                # 如果是流式响应，收集所有数据块
+                if stream:
+                    from openai.types.chat import ChatCompletion
+                    from openai.types.chat.chat_completion import Choice
+                    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+                    
+                    content_parts = []
+                    usage_data = None
+                    finish_reason = None
+                    role = None
+                    chunk_id = ""
+                    chunk_model = api_params.get("model", "")
+                    chunk_created = int(time.time())
+                    
+                    for chunk in response:
+                        if hasattr(chunk, 'id') and chunk.id:
+                            chunk_id = chunk.id
+                        if hasattr(chunk, 'model') and chunk.model:
+                            chunk_model = chunk.model
+                        if hasattr(chunk, 'created') and chunk.created:
+                            chunk_created = chunk.created
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta
+                            if delta.content:
+                                content_parts.append(delta.content)
+                            if delta.role:
+                                role = delta.role
+                            if chunk.choices[0].finish_reason:
+                                finish_reason = chunk.choices[0].finish_reason
+                        if hasattr(chunk, 'usage') and chunk.usage:
+                            usage_data = chunk.usage
+                    
+                    # 构建完整的响应对象
+                    full_content = "".join(content_parts)
+                    message = ChatCompletionMessage(
+                        role=role or "assistant",
+                        content=full_content
+                    )
+                    choice = Choice(
+                        index=0,
+                        message=message,
+                        finish_reason=finish_reason
+                    )
+                    response = ChatCompletion(
+                        id=chunk_id,
+                        model=chunk_model,
+                        choices=[choice],
+                        created=chunk_created,
+                        object="chat.completion",
+                        usage=usage_data
+                    )
+                
+                if attempt > 0:
+                    logger.info(f"重试成功（第 {attempt + 1} 次尝试）")
+                return response
+                
+            except (InternalServerError, APITimeoutError) as e:
+                # 对于500错误和超时错误，进行重试
+                last_exception = e
+                error_type = "服务器内部错误" if isinstance(e, InternalServerError) else "请求超时"
+                logger.warning(f"API调用失败（{error_type}）: {e}")
+                if attempt < max_retries:
+                    continue
+                else:
+                    logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                    raise ValueError(f"API调用失败（{error_type}）: {e}")
+                    
+            except APIError as e:
+                # 对于其他API错误，根据状态码决定是否重试
+                last_exception = e
+                status_code = getattr(e, 'status_code', None)
+                # 5xx错误可以重试，4xx错误（客户端错误）不重试
+                if status_code and 500 <= status_code < 600:
+                    logger.warning(f"API调用失败（服务器错误 {status_code}）: {e}")
+                    if attempt < max_retries:
+                        continue
+                    else:
+                        logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                        raise ValueError(f"API调用失败（服务器错误 {status_code}）: {e}")
+                else:
+                    # 客户端错误（4xx）不重试，直接抛出
+                    logger.error(f"API调用失败（客户端错误）: {e}")
+                    raise ValueError(f"API调用失败: {e}")
+                    
+            except Exception as e:
+                # 其他异常（网络错误等）也进行重试
+                last_exception = e
+                logger.warning(f"API调用失败（未知错误）: {e}")
+                if attempt < max_retries:
+                    continue
+                else:
+                    logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                    raise ValueError(f"API调用失败: {e}")
+        
+        # 如果所有重试都失败，抛出最后一个异常
+        if last_exception:
+            raise ValueError(f"API调用失败: {last_exception}")
+
     def evaluate_single_run(
         self,
-        points: list[dict[str, Any]],
+        checkpoints: list[str],
         target_document_path: str | Path,
     ) -> DocumentEvaluation:
         """
         单次评估运行
 
         Args:
-            points: 要点清单
+            checkpoints: 检查项清单
             target_document_path: 待评估文档路径
 
         Returns:
@@ -224,13 +413,13 @@ class Evaluator:
         # 加载prompt模板
         template = self._load_prompt_template("evaluate_points.txt")
 
-        # 准备要点JSON
-        points_json = json.dumps({"points": points}, ensure_ascii=False, indent=2)
-        logger.debug(f"要点数量: {len(points)}, JSON长度: {len(points_json)} 字符")
+        # 准备检查项CSV表格
+        checkpoints_table = self._format_checkpoints_as_csv(checkpoints)
+        logger.debug(f"检查项数量: {len(checkpoints)}, CSV长度: {len(checkpoints_table)} 字符")
 
         # 填充模板
         prompt = template.format(
-            points_json=points_json, target_content=target_content
+            checkpoints_table=checkpoints_table, target_content=target_content
         )
         logger.debug(f"完整prompt长度: {len(prompt)} 字符")
         # 记录完整Prompt内容
@@ -247,7 +436,7 @@ class Evaluator:
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一个专业的需求文档评估专家。严格按照JSON格式输出，不要有任何其他文字。",
+                    "content": "You are a professional requirements document evaluation expert. You must wrap CSV format output in ```csv code blocks, each line must contain three columns: Index,Reason,Result. The third column Result must be yes or no, absolutely cannot be omitted. Do not output any other text or comments outside the code blocks.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -258,6 +447,9 @@ class Evaluator:
         if self.config.openai.max_tokens is not None:
             api_params["max_tokens"] = self.config.openai.max_tokens
         
+        # 添加 stream 参数
+        api_params["stream"] = self.config.openai.stream
+        
         # 记录API调用参数
         logger.info(f"调用API - 模型: {api_params['model']}, temperature: {api_params['temperature']}, "
                    f"max_tokens: {api_params.get('max_tokens', 'None')}")
@@ -266,25 +458,13 @@ class Evaluator:
         # 记录请求开始时间
         start_time = time.time()
         
-        # 尝试添加response_format，如果API不支持会自动失败并回退
+        # 调用API（带重试机制）
         try:
-            api_params["response_format"] = {"type": "json_object"}
-            response = self.client.chat.completions.create(**api_params)
-        except Exception as e:
-            # 如果response_format不支持，尝试不使用它
-            if "response_format" in str(e).lower() or "response" in str(e).lower():
-                logger.warning("API可能不支持response_format参数，尝试不使用该参数...")
-                api_params.pop("response_format", None)
-                try:
-                    response = self.client.chat.completions.create(**api_params)
-                except Exception as e2:
-                    logger.error(f"API调用失败: {e2}")
-                    logger.debug(f"API调用失败详情:", exc_info=True)
-                    raise ValueError(f"API调用失败: {e2}")
-            else:
-                logger.error(f"API调用失败: {e}")
-                logger.debug(f"API调用失败详情:", exc_info=True)
-                raise ValueError(f"API调用失败: {e}")
+            response = self._call_api_with_retry(api_params)
+        except ValueError as e:
+            # 重试机制已经记录了详细错误信息
+            logger.debug(f"API调用失败详情:", exc_info=True)
+            raise
         
         # 记录响应时间
         elapsed_time = time.time() - start_time
@@ -324,7 +504,7 @@ class Evaluator:
         logger.debug("=" * 80)
 
         # 清理markdown代码块标记
-        cleaned_text = self._extract_json_from_markdown(result_text)
+        cleaned_text = self._extract_text_from_markdown(result_text)
         logger.debug(f"清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
         # 记录完整清理后文本内容
         logger.debug("=" * 80)
@@ -334,63 +514,22 @@ class Evaluator:
         logger.debug("=" * 80)
 
         try:
-            result_json = json.loads(cleaned_text)
-            evaluations_data = result_json.get("evaluations", [])
-            logger.info(f"成功解析JSON，包含 {len(evaluations_data)} 个评估结果")
-            logger.debug(f"评估结果要点ID: {[e.get('point_id', '') for e in evaluations_data[:10]]}")
-
-            # 转换为EvaluationResult对象
-            evaluations = []
-            for eval_data in evaluations_data:
-                exists = eval_data.get("exists", False)
-                point_id = eval_data.get("point_id", "")
-                
-                # 找到对应的要点，获取检查项列表
-                point = next((p for p in points if p.get("id") == point_id), None)
-                expected_checkpoints = point.get("checkpoints", []) if point else []
-                
-                # 解析检查项结果
-                checkpoint_results = []
-                
-                if exists and expected_checkpoints:
-                    # 新格式：只输出通过的检查项索引
-                    passed_indices = eval_data.get("passed", [])
-                    # 验证索引有效性（0到len(checkpoints)-1）
-                    max_index = len(expected_checkpoints) - 1
-                    passed_indices_set = {idx for idx in passed_indices if isinstance(idx, int) and 0 <= idx <= max_index}
-                    
-                    # 按照要点中的检查项顺序创建结果
-                    for index, expected_cp in enumerate(expected_checkpoints):
-                        passed = index in passed_indices_set
-                        checkpoint_results.append(
-                            CheckpointResult(checkpoint=expected_cp, passed=passed)
-                        )
-                elif expected_checkpoints:
-                    # 如果要点不存在，所有检查项必须为False
-                    for expected_cp in expected_checkpoints:
-                        checkpoint_results.append(
-                            CheckpointResult(checkpoint=expected_cp, passed=False)
-                        )
-                
-                evaluations.append(
-                    EvaluationResult(
-                        point_id=point_id,
-                        exists=exists,
-                        checkpoint_results=checkpoint_results if checkpoint_results else None,
-                        explanation=eval_data.get("explanation", ""),
-                    )
-                )
+            # 解析CSV格式的结果
+            checkpoint_results = self._parse_csv_result(cleaned_text, checkpoints)
+            
+            # 统计通过的检查项数量
+            total_passed = sum(1 for cp in checkpoint_results if cp.passed)
+            logger.info(f"成功解析CSV，共 {total_passed} 个通过的检查项（共 {len(checkpoints)} 个检查项）")
 
             evaluation = DocumentEvaluation(
                 target_document=str(target_document_path),
-                points=points,
-                evaluations=evaluations,
+                checkpoints=checkpoints,
+                checkpoint_results=checkpoint_results,
             )
-            logger.info(f"评估完成 - 完整性: {evaluation.completeness:.2f}, "
-                       f"准确性: {evaluation.accuracy:.2f}, "
+            logger.info(f"评估完成 - 准确性: {evaluation.accuracy:.2f}, "
                        f"综合: {evaluation.comprehensive:.2f}")
             return evaluation
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
+        except (ValueError, csv.Error) as e:
             # 提供更详细的错误信息
             error_preview = result_text[:500] if len(result_text) > 500 else result_text
             cleaned_preview = cleaned_text[:500] if len(cleaned_text) > 500 else cleaned_text
@@ -405,7 +544,7 @@ class Evaluator:
 
     def evaluate_multiple_runs(
         self,
-        points: list[dict[str, Any]],
+        checkpoints: list[str],
         target_document_path: str | Path,
         runs: int = 3,
         merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
@@ -416,7 +555,7 @@ class Evaluator:
         每个评委独立评估，各自得到一个准确性分数，然后使用指定策略合并这些分数。
 
         Args:
-            points: 要点清单
+            checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             runs: 运行次数（评委数量）
             merge_strategy: 合并策略，可选值：
@@ -436,7 +575,7 @@ class Evaluator:
         # 并行执行多次评估
         with ThreadPoolExecutor(max_workers=runs) as executor:
             futures = {
-                executor.submit(self.evaluate_single_run, points, target_document_path): i
+                executor.submit(self.evaluate_single_run, checkpoints, target_document_path): i
                 for i in range(runs)
             }
             
@@ -471,15 +610,15 @@ class Evaluator:
         merged_completeness = statistics.mean(completeness_scores)
         merged_comprehensive = statistics.mean(comprehensive_scores)
 
-        # 使用第一个评委的详细评估结果（evaluations字段）
-        # 这样可以保留要点的详细评估信息
+        # 使用第一个评委的详细评估结果（checkpoint_results字段）
+        # 这样可以保留检查项的详细评估信息
         first_result = results[0]
 
         # 创建最终结果对象，手动设置合并后的分数
         final_result = DocumentEvaluation(
             target_document=str(target_document_path),
-            points=points,
-            evaluations=first_result.evaluations,
+            checkpoints=checkpoints,
+            checkpoint_results=first_result.checkpoint_results,
         )
         
         # 覆盖计算出的分数，使用合并后的分数
@@ -492,7 +631,7 @@ class Evaluator:
     def merge_evaluation_results(
         self,
         raw_results: list[DocumentEvaluation],
-        points: list[dict[str, Any]],
+        checkpoints: list[str],
         target_document_path: str | Path,
         merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
     ) -> DocumentEvaluation:
@@ -503,7 +642,7 @@ class Evaluator:
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
-            points: 要点清单
+            checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             merge_strategy: 合并策略
         
@@ -530,15 +669,15 @@ class Evaluator:
         merged_completeness = statistics.mean(completeness_scores)
         merged_comprehensive = statistics.mean(comprehensive_scores)
 
-        # 使用第一个评委的详细评估结果（evaluations字段）
-        # 这样可以保留要点的详细评估信息
+        # 使用第一个评委的详细评估结果（checkpoint_results字段）
+        # 这样可以保留检查项的详细评估信息
         first_result = raw_results[0]
 
         # 创建最终结果对象，手动设置合并后的分数
         final_result = DocumentEvaluation(
             target_document=str(target_document_path),
-            points=points,
-            evaluations=first_result.evaluations,
+            checkpoints=checkpoints,
+            checkpoint_results=first_result.checkpoint_results,
         )
         
         # 覆盖计算出的分数，使用合并后的分数
@@ -551,7 +690,7 @@ class Evaluator:
     def merge_evaluation_results_by_checkpoints(
         self,
         raw_results: list[DocumentEvaluation],
-        points: list[dict[str, Any]],
+        checkpoints: list[str],
         target_document_path: str | Path,
         merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
     ) -> DocumentEvaluation:
@@ -562,7 +701,7 @@ class Evaluator:
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
-            points: 要点清单
+            checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             merge_strategy: 合并策略
         
@@ -578,76 +717,46 @@ class Evaluator:
             return raw_results[0]
 
         # 合并评估结果（基于检查项结果）
-        point_evaluations = {}
+        checkpoint_votes = {}  # checkpoint_index -> {passed_count, total_count, pass_rates}
         for result in raw_results:
-            for eval_result in result.evaluations:
-                point_id = eval_result.point_id
-                if point_id not in point_evaluations:
-                    point_evaluations[point_id] = {
-                        "exists_count": 0,
-                        "checkpoint_votes": {},  # checkpoint -> {passed_count, total_count, pass_rates}
-                        "explanations": [],
+            for index, cp_result in enumerate(result.checkpoint_results):
+                if index not in checkpoint_votes:
+                    checkpoint_votes[index] = {
+                        "passed_count": 0,
+                        "total_count": 0,
+                        "pass_rates": [],  # 保存每个评委的 pass_rate
                     }
-                if eval_result.exists:
-                    point_evaluations[point_id]["exists_count"] += 1
-                
-                # 统计检查项结果
-                if eval_result.checkpoint_results:
-                    for cp_result in eval_result.checkpoint_results:
-                        cp_text = cp_result.checkpoint
-                        if cp_text not in point_evaluations[point_id]["checkpoint_votes"]:
-                            point_evaluations[point_id]["checkpoint_votes"][cp_text] = {
-                                "passed_count": 0,
-                                "total_count": 0,
-                                "pass_rates": [],  # 保存每个评委的 pass_rate
-                            }
-                        point_evaluations[point_id]["checkpoint_votes"][cp_text]["total_count"] += 1
-                        if cp_result.passed:
-                            point_evaluations[point_id]["checkpoint_votes"][cp_text]["passed_count"] += 1
-                        # 保存每个评委的 pass_rate（用于中位数计算）
-                        point_evaluations[point_id]["checkpoint_votes"][cp_text]["pass_rates"].append(
-                            cp_result.pass_rate
-                        )
-                
-                point_evaluations[point_id]["explanations"].append(
-                    eval_result.explanation
+                checkpoint_votes[index]["total_count"] += 1
+                if cp_result.passed:
+                    checkpoint_votes[index]["passed_count"] += 1
+                # 保存每个评委的 pass_rate（用于中位数计算）
+                checkpoint_votes[index]["pass_rates"].append(
+                    cp_result.pass_rate
                 )
         
-        # 创建合并后的评估结果
-        avg_evaluations = []
-        for point_id, data in point_evaluations.items():
-            exists = data["exists_count"] > (runs / 2)  # 多数存在则认为存在
+        # 创建合并后的检查项结果
+        merged_checkpoint_results = []
+        for index, checkpoint in enumerate(checkpoints):
+            votes = checkpoint_votes.get(index, {
+                "passed_count": 0,
+                "total_count": runs,
+                "pass_rates": [0.0] * runs,
+            })
             
             # 合并检查项结果：根据策略选择不同算法
-            avg_checkpoint_results = []
-            for cp_text, votes in data["checkpoint_votes"].items():
-                pass_rate, passed = self._merge_checkpoint_by_strategy(
-                    votes, runs, exists, merge_strategy
-                )
-                avg_checkpoint_results.append(
-                    CheckpointResult(checkpoint=cp_text, passed=passed, pass_rate=pass_rate)
-                )
-            
-            # 使用最常见的解释
-            explanation = max(
-                set(data["explanations"]), key=data["explanations"].count
+            pass_rate, passed = self._merge_checkpoint_by_strategy(
+                votes, runs, True, merge_strategy
             )
-            
-            avg_evaluations.append(
-                EvaluationResult(
-                    point_id=point_id,
-                    exists=exists,
-                    checkpoint_results=avg_checkpoint_results if avg_checkpoint_results else None,
-                    explanation=explanation,
-                )
+            merged_checkpoint_results.append(
+                CheckpointResult(checkpoint=checkpoint, passed=passed, pass_rate=pass_rate)
             )
         
         # 创建最终结果对象
         # DocumentEvaluation 的 __init__ 方法会基于合并后的检查项结果自动计算分数
         final_result = DocumentEvaluation(
             target_document=str(target_document_path),
-            points=points,
-            evaluations=avg_evaluations,
+            checkpoints=checkpoints,
+            checkpoint_results=merged_checkpoint_results,
         )
         
         return final_result

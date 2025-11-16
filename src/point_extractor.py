@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
@@ -31,33 +31,33 @@ class PointExtractor:
         self.client = OpenAI(
             api_key=self.config.openai.api_key,
             base_url=self.config.openai.base_url,
+            timeout=self.config.openai.timeout,
         )
         self.parser = DocumentParser()
 
     @staticmethod
-    def _extract_json_from_markdown(text: str) -> str:
+    def _clean_text_output(text: str) -> str:
         """
-        从markdown代码块中提取JSON内容
+        清理文本输出，移除markdown代码块标记等
         
         处理以下情况：
-        - ```json ... ```
         - ``` ... ```
-        - 纯JSON（无代码块标记）
+        - 纯文本
         
         Args:
             text: 可能包含markdown代码块的文本
             
         Returns:
-            清理后的JSON文本
+            清理后的文本
         """
         text = text.strip()
         
-        # 尝试匹配 ```json ... ``` 或 ``` ... ```
+        # 尝试匹配 ``` ... ```
         if text.startswith("```"):
             # 找到第一个换行符（代码块开始标记之后）
             first_newline = text.find("\n")
             if first_newline != -1:
-                # 移除开始标记（```json 或 ```）
+                # 移除开始标记（``` 或 ```xxx）
                 text = text[first_newline + 1:]
             
             # 找到最后一个 ```（代码块结束标记）
@@ -67,6 +67,26 @@ class PointExtractor:
                 text = text[:last_code_block]
         
         return text.strip()
+    
+    @staticmethod
+    def _remove_numbering(line: str) -> str:
+        """
+        移除行首的编号或标记
+        
+        Args:
+            line: 文本行
+            
+        Returns:
+            移除编号后的文本
+        """
+        line = line.strip()
+        # 移除常见的编号格式：1. 2. 3. 或 1) 2) 3) 或 - * • 等
+        import re
+        # 匹配开头的数字编号（如 "1. ", "1) ", "1、", "1. " 等）
+        line = re.sub(r'^\d+[\.\)、]\s*', '', line)
+        # 匹配开头的符号（如 "- ", "* ", "• ", "· " 等）
+        line = re.sub(r'^[-*•·]\s+', '', line)
+        return line.strip()
 
     def _load_prompt_template(self, template_name: str) -> str:
         """
@@ -120,37 +140,37 @@ class PointExtractor:
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _save_points_cache(
-        self, document_path: str | Path, points: list[dict[str, Any]], content_hash: str
+        self, document_path: str | Path, checkpoints: list[str], content_hash: str
     ) -> None:
         """
-        保存要点清单到缓存文件
+        保存检查项清单到缓存文件
 
         Args:
             document_path: 文档路径
-            points: 要点清单
+            checkpoints: 检查项清单
             content_hash: 文档内容hash
         """
         cache_path = self._get_cache_path(document_path)
         cache_data = {
             "document_path": str(Path(document_path).absolute()),
             "content_hash": content_hash,
-            "points": points,
+            "checkpoints": checkpoints,
         }
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
     def _load_points_cache(
         self, document_path: str | Path, content_hash: str | None = None
-    ) -> list[dict[str, Any]] | None:
+    ) -> list[str] | None:
         """
-        从缓存文件加载要点清单
+        从缓存文件加载检查项清单
 
         Args:
             document_path: 文档路径
             content_hash: 文档内容hash（用于验证缓存有效性，如果为None则不验证）
 
         Returns:
-            要点清单，如果缓存不存在或无效则返回None
+            检查项清单，如果缓存不存在或无效则返回None
         """
         cache_path = self._get_cache_path(document_path)
         
@@ -172,23 +192,150 @@ class PointExtractor:
                 if cached_hash != content_hash:
                     return None
             
-            points = cache_data.get("points", [])
-            if not points:
+            # 读取checkpoints数组
+            checkpoints = cache_data.get("checkpoints", [])
+            if not checkpoints:
                 return None
             
-            return points
+            return checkpoints
         except (json.JSONDecodeError, KeyError, IOError):
             return None
 
-    def _extract_points_single(self, content: str) -> list[dict[str, Any]]:
+    def _call_api_with_retry(self, api_params: dict[str, Any]) -> Any:
         """
-        单次提取要点清单（内部方法）
+        带重试机制的API调用方法
+        
+        Args:
+            api_params: API调用参数
+            
+        Returns:
+            API响应对象（如果是流式响应，则返回收集后的完整响应）
+            
+        Raises:
+            ValueError: 所有重试都失败后抛出异常
+        """
+        max_retries = self.config.openai.max_retries
+        retry_delay = self.config.openai.retry_delay
+        last_exception = None
+        stream = api_params.get("stream", False)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    # 指数退避：延迟时间 = 初始延迟 * 2^(attempt-1)
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    logger.warning(f"第 {attempt + 1}/{max_retries + 1} 次尝试，等待 {delay:.1f} 秒后重试...")
+                    time.sleep(delay)
+                
+                response = self.client.chat.completions.create(**api_params)
+                
+                # 如果是流式响应，收集所有数据块
+                if stream:
+                    from openai.types.chat import ChatCompletion
+                    from openai.types.chat.chat_completion import Choice
+                    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+                    
+                    content_parts = []
+                    usage_data = None
+                    finish_reason = None
+                    role = None
+                    chunk_id = ""
+                    chunk_model = api_params.get("model", "")
+                    chunk_created = int(time.time())
+                    
+                    for chunk in response:
+                        if hasattr(chunk, 'id') and chunk.id:
+                            chunk_id = chunk.id
+                        if hasattr(chunk, 'model') and chunk.model:
+                            chunk_model = chunk.model
+                        if hasattr(chunk, 'created') and chunk.created:
+                            chunk_created = chunk.created
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta
+                            if delta.content:
+                                content_parts.append(delta.content)
+                            if delta.role:
+                                role = delta.role
+                            if chunk.choices[0].finish_reason:
+                                finish_reason = chunk.choices[0].finish_reason
+                        if hasattr(chunk, 'usage') and chunk.usage:
+                            usage_data = chunk.usage
+                    
+                    # 构建完整的响应对象
+                    full_content = "".join(content_parts)
+                    message = ChatCompletionMessage(
+                        role=role or "assistant",
+                        content=full_content
+                    )
+                    choice = Choice(
+                        index=0,
+                        message=message,
+                        finish_reason=finish_reason
+                    )
+                    response = ChatCompletion(
+                        id=chunk_id,
+                        model=chunk_model,
+                        choices=[choice],
+                        created=chunk_created,
+                        object="chat.completion",
+                        usage=usage_data
+                    )
+                
+                if attempt > 0:
+                    logger.info(f"重试成功（第 {attempt + 1} 次尝试）")
+                return response
+                
+            except (InternalServerError, APITimeoutError) as e:
+                # 对于500错误和超时错误，进行重试
+                last_exception = e
+                error_type = "服务器内部错误" if isinstance(e, InternalServerError) else "请求超时"
+                logger.warning(f"API调用失败（{error_type}）: {e}")
+                if attempt < max_retries:
+                    continue
+                else:
+                    logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                    raise ValueError(f"API调用失败（{error_type}）: {e}")
+                    
+            except APIError as e:
+                # 对于其他API错误，根据状态码决定是否重试
+                last_exception = e
+                status_code = getattr(e, 'status_code', None)
+                # 5xx错误可以重试，4xx错误（客户端错误）不重试
+                if status_code and 500 <= status_code < 600:
+                    logger.warning(f"API调用失败（服务器错误 {status_code}）: {e}")
+                    if attempt < max_retries:
+                        continue
+                    else:
+                        logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                        raise ValueError(f"API调用失败（服务器错误 {status_code}）: {e}")
+                else:
+                    # 客户端错误（4xx）不重试，直接抛出
+                    logger.error(f"API调用失败（客户端错误）: {e}")
+                    raise ValueError(f"API调用失败: {e}")
+                    
+            except Exception as e:
+                # 其他异常（网络错误等）也进行重试
+                last_exception = e
+                logger.warning(f"API调用失败（未知错误）: {e}")
+                if attempt < max_retries:
+                    continue
+                else:
+                    logger.error(f"所有 {max_retries + 1} 次尝试均失败")
+                    raise ValueError(f"API调用失败: {e}")
+        
+        # 如果所有重试都失败，抛出最后一个异常
+        if last_exception:
+            raise ValueError(f"API调用失败: {last_exception}")
+
+    def _extract_points_single(self, content: str) -> list[str]:
+        """
+        单次提取检查项清单（内部方法）
 
         Args:
             content: 文档内容
 
         Returns:
-            要点清单
+            检查项清单（平铺的checkpoints数组）
         """
         # 加载prompt模板
         template = self._load_prompt_template("extract_points.txt")
@@ -211,13 +358,12 @@ class PointExtractor:
             logger.warning(f"Prompt内容较长 ({len(prompt)} 字符)，可能需要较长时间处理")
 
         # 调用OpenAI API
-        # 尝试使用response_format，如果不支持则回退
         api_params = {
             "model": self.config.openai.model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是一个专业的需求文档分析专家。严格按照JSON格式输出，不要有任何其他文字。",
+                    "content": "You are a professional requirements document analysis expert. Strictly follow the requirements for output, one checkpoint per line, without any other explanatory text.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -228,6 +374,9 @@ class PointExtractor:
         if self.config.openai.max_tokens is not None:
             api_params["max_tokens"] = self.config.openai.max_tokens
         
+        # 添加 stream 参数
+        api_params["stream"] = self.config.openai.stream
+        
         # 记录API调用参数
         logger.info(f"调用API - 模型: {api_params['model']}, temperature: {api_params['temperature']}, "
                    f"max_tokens: {api_params.get('max_tokens', 'None')}")
@@ -236,25 +385,13 @@ class PointExtractor:
         # 记录请求开始时间
         start_time = time.time()
         
-        # 尝试添加response_format，如果API不支持会自动失败并回退
+        # 调用API（带重试机制）
         try:
-            api_params["response_format"] = {"type": "json_object"}
-            response = self.client.chat.completions.create(**api_params)
-        except Exception as e:
-            # 如果response_format不支持，尝试不使用它
-            if "response_format" in str(e).lower() or "response" in str(e).lower():
-                logger.warning("API可能不支持response_format参数，尝试不使用该参数...")
-                api_params.pop("response_format", None)
-                try:
-                    response = self.client.chat.completions.create(**api_params)
-                except Exception as e2:
-                    logger.error(f"API调用失败: {e2}")
-                    logger.debug(f"API调用失败详情:", exc_info=True)
-                    raise ValueError(f"API调用失败: {e2}")
-            else:
-                logger.error(f"API调用失败: {e}")
-                logger.debug(f"API调用失败详情:", exc_info=True)
-                raise ValueError(f"API调用失败: {e}")
+            response = self._call_api_with_retry(api_params)
+        except ValueError as e:
+            # 重试机制已经记录了详细错误信息
+            logger.debug(f"API调用失败详情:", exc_info=True)
+            raise
         
         # 记录响应时间
         elapsed_time = time.time() - start_time
@@ -293,8 +430,8 @@ class PointExtractor:
         logger.debug(result_text)
         logger.debug("=" * 80)
 
-        # 清理markdown代码块标记
-        cleaned_text = self._extract_json_from_markdown(result_text)
+        # 清理文本：移除markdown代码块标记（如果有）
+        cleaned_text = self._clean_text_output(result_text)
         logger.debug(f"清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
         # 记录完整清理后文本内容
         logger.debug("=" * 80)
@@ -304,43 +441,57 @@ class PointExtractor:
         logger.debug("=" * 80)
 
         try:
-            result_json = json.loads(cleaned_text)
-            points = result_json.get("points", [])
-            if not points:
-                logger.error("未提取到任何要点")
-                raise ValueError("未提取到任何要点")
-            logger.info(f"成功解析JSON，提取到 {len(points)} 个要点")
-            logger.debug(f"要点ID列表: {[p.get('id', '') for p in points[:10]]}")
-            return points
-        except json.JSONDecodeError as e:
+            # 按行解析检查项
+            checkpoints = []
+            lines = cleaned_text.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                # 跳过空行
+                if not line:
+                    continue
+                # 跳过明显的编号或标记（如 "1. ", "- ", "* " 等）
+                line = self._remove_numbering(line)
+                # 跳过太短的行（可能是格式标记）
+                if len(line) < 3:
+                    continue
+                checkpoints.append(line)
+            
+            if not checkpoints:
+                logger.error("未提取到任何检查项")
+                raise ValueError("未提取到任何检查项")
+            
+            logger.info(f"成功解析文本，提取到 {len(checkpoints)} 个检查项")
+            return checkpoints
+        except Exception as e:
             # 提供更详细的错误信息
             error_preview = result_text[:500] if len(result_text) > 500 else result_text
             cleaned_preview = cleaned_text[:500] if len(cleaned_text) > 500 else cleaned_text
-            logger.error(f"解析JSON失败: {e}")
-            logger.debug(f"解析JSON失败详情:", exc_info=True)
+            logger.error(f"解析文本失败: {e}")
+            logger.debug(f"解析文本失败详情:", exc_info=True)
             logger.debug(f"原始响应（前500字符）: {error_preview}")
             logger.debug(f"清理后文本（前500字符）: {cleaned_preview}")
             logger.debug(f"原始响应完整长度: {len(result_text)} 字符")
             logger.debug(f"清理后文本完整长度: {len(cleaned_text)} 字符")
             # 异常消息只包含简短信息，详细内容已在日志文件中记录
-            raise ValueError(f"解析JSON失败: {e} (详细内容请查看日志文件)")
+            raise ValueError(f"解析文本失败: {e} (详细内容请查看日志文件)")
 
     def extract_points(
         self,
         document_path: str | Path,
         force_extract: bool = False,
         extract_runs: int = 1,
-    ) -> list[dict[str, Any]]:
+    ) -> list[str]:
         """
-        从文档中提取结构化要点清单（支持缓存和多次提取取最优）
+        从文档中提取检查项清单（支持缓存和多次提取取最优）
 
         Args:
             document_path: 文档路径
             force_extract: 是否强制重新提取（忽略缓存）
-            extract_runs: 提取运行次数，多次提取后选择要点数量最多的结果（默认1次）
+            extract_runs: 提取运行次数，多次提取后选择检查项数量最多的结果（默认1次）
 
         Returns:
-            要点清单，格式为 [{"id": "1", "level": 1, "title": "...", ...}, ...]
+            检查项清单，格式为 ["检查项1", "检查项2", ...]
         """
         # 读取文档内容
         content = self.parser.read_markdown(document_path)
@@ -353,27 +504,27 @@ class PointExtractor:
 
         # 尝试从缓存加载
         if not force_extract:
-            cached_points = self._load_points_cache(document_path, content_hash)
-            if cached_points is not None:
-                logger.info(f"✓ 从缓存加载要点清单（{len(cached_points)} 个要点）")
-                return cached_points
+            cached_checkpoints = self._load_points_cache(document_path, content_hash)
+            if cached_checkpoints is not None:
+                logger.info(f"✓ 从缓存加载检查项清单（{len(cached_checkpoints)} 个检查项）")
+                return cached_checkpoints
 
         # 缓存不存在或强制重新提取，调用API提取
-        logger.info(f"开始提取要点，文档: {document_path}, 提取次数: {extract_runs}, 强制提取: {force_extract}")
+        logger.info(f"开始提取检查项，文档: {document_path}, 提取次数: {extract_runs}, 强制提取: {force_extract}")
         if extract_runs <= 1:
             # 单次提取
-            points = self._extract_points_single(content)
-            logger.info(f"✓ 成功提取 {len(points)} 个要点")
+            checkpoints = self._extract_points_single(content)
+            logger.info(f"✓ 成功提取 {len(checkpoints)} 个检查项")
         else:
-            # 多次提取，并行执行，选择要点数量最多的结果
-            logger.info(f"正在并行执行 {extract_runs} 次提取，选择要点数量最多的结果...")
+            # 多次提取，并行执行，选择检查项数量最多的结果
+            logger.info(f"正在并行执行 {extract_runs} 次提取，选择检查项数量最多的结果...")
             all_results = []
             
-            def extract_with_index(i: int) -> tuple[int, list[dict[str, Any]]]:
+            def extract_with_index(i: int) -> tuple[int, list[str]]:
                 """带索引的提取函数，用于并行执行"""
                 try:
-                    points = self._extract_points_single(content)
-                    return (i, points)
+                    checkpoints = self._extract_points_single(content)
+                    return (i, checkpoints)
                 except Exception as e:
                     logger.error(f"  第 {i+1}/{extract_runs} 次提取失败: {e}")
                     logger.debug(f"提取失败详情:", exc_info=True)
@@ -389,27 +540,27 @@ class PointExtractor:
                 completed = 0
                 for future in as_completed(futures):
                     completed += 1
-                    i, points = future.result()
-                    if points is not None:
-                        all_results.append(points)
-                        logger.info(f"  [{completed}/{extract_runs}] 第 {i+1} 次提取完成: {len(points)} 个要点")
+                    i, checkpoints = future.result()
+                    if checkpoints is not None:
+                        all_results.append(checkpoints)
+                        logger.info(f"  [{completed}/{extract_runs}] 第 {i+1} 次提取完成: {len(checkpoints)} 个检查项")
             
             if not all_results:
                 raise ValueError("所有提取尝试均失败")
             
-            # 选择要点数量最多的结果
-            points = max(all_results, key=len)
-            logger.info(f"✓ 选择最优结果：{len(points)} 个要点（从 {len(all_results)} 次成功提取中选择）")
+            # 选择检查项数量最多的结果
+            checkpoints = max(all_results, key=len)
+            logger.info(f"✓ 选择最优结果：{len(checkpoints)} 个检查项（从 {len(all_results)} 次成功提取中选择）")
             
             # 显示其他结果的统计信息
             if len(all_results) > 1:
-                point_counts = [len(p) for p in all_results]
-                logger.info(f"  提取结果统计：最少 {min(point_counts)} 个，最多 {max(point_counts)} 个，平均 {sum(point_counts)/len(point_counts):.1f} 个")
+                checkpoint_counts = [len(cp) for cp in all_results]
+                logger.info(f"  提取结果统计（检查项数量）：最少 {min(checkpoint_counts)} 个，最多 {max(checkpoint_counts)} 个，平均 {sum(checkpoint_counts)/len(checkpoint_counts):.1f} 个")
         
         # 保存到缓存
-        self._save_points_cache(document_path, points, content_hash)
+        self._save_points_cache(document_path, checkpoints, content_hash)
         cache_path = self._get_cache_path(document_path)
-        logger.info(f"✓ 要点清单已保存到缓存: {cache_path}")
+        logger.info(f"✓ 检查项清单已保存到缓存: {cache_path}")
         
-        return points
+        return checkpoints
 

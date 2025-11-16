@@ -18,6 +18,10 @@ class OpenAIConfig(BaseModel):
     )
     temperature: float = Field(default=0.0, description="温度参数，固定为0确保可重复性")
     max_tokens: Optional[int] = Field(default=None, description="最大token数，None时使用API默认值")
+    timeout: float = Field(default=900.0, description="API调用超时时间（秒）")
+    max_retries: int = Field(default=3, description="最大重试次数")
+    retry_delay: float = Field(default=1.0, description="重试延迟初始值（秒），使用指数退避")
+    stream: bool = Field(default=True, description="是否启用流式响应")
 
 
 class EvalConfig(BaseModel):
@@ -59,6 +63,10 @@ def load_config() -> Config:
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         temperature=float(os.getenv("TEMPERATURE", "0")),
         max_tokens=max_tokens,
+        timeout=float(os.getenv("OPENAI_TIMEOUT", "900")),
+        max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
+        retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
+        stream=os.getenv("OPENAI_STREAM", "true").lower() in ("true", "1", "yes"),
     )
 
     eval_config = EvalConfig(

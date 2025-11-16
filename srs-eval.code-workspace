@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../srs-docs"
+		},
+		{
+			"path": "../srs-gen"
+		}
+	],
+	"settings": {}
+}

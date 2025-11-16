@@ -1,44 +1,21 @@
-你是一个专业的需求文档分析专家。请仔细阅读以下需求文档，提取出结构化的要点清单。
+You are a professional requirements document analysis expert. Please carefully read the following requirements document and extract all requirement checkpoints.
 
-要求：
-1. 将文档内容拆解为层级化的要点结构（一级要点、二级要点等）
-2. 每个要点应包含：标题、描述、关键信息
-3. **重要**：为每个要点生成3-5个具体的检查项（checkpoints），这些检查项应该是可验证的、客观的、量化的标准
-4. 检查项应该是具体的、可检验的陈述，例如："文档中明确提到了X功能"、"文档中包含了Y的具体实现方法"等
-5. 要点应该覆盖文档的所有重要内容
-6. 输出格式必须是严格的JSON格式
+Requirements:
+1. Carefully read the document and extract all important requirement checkpoints
+2. **Important**: Checkpoints should be verifiable, objective, and quantifiable standards. Cover all aspects of the document as comprehensively as possible, including but not limited to: functional requirements, performance requirements, security, usability, data integrity, error handling, boundary conditions, etc.
+3. Checkpoints should be specific, verifiable statements that directly describe requirement content, for example: "Support user registration and login", "Search response time less than 5 seconds", "Use SSL encryption for transmission", etc.
+4. Checkpoints should cover all important content in the document
+5. Output format: One checkpoint per line, output the checkpoint content directly, no numbering, no other explanatory text
 
-输出JSON格式：
-{{
-  "points": [
-    {{
-      "id": "1",
-      "level": 1,
-      "title": "要点标题",
-      "description": "要点描述",
-      "key_info": ["关键信息1", "关键信息2"],
-      "checkpoints": [
-        "检查项1：具体可验证的陈述",
-        "检查项2：具体可验证的陈述",
-        "检查项3：具体可验证的陈述"
-      ]
-    }},
-    {{
-      "id": "1.1",
-      "level": 2,
-      "title": "子要点标题",
-      "description": "子要点描述",
-      "key_info": ["关键信息1"],
-      "checkpoints": [
-        "检查项1：具体可验证的陈述",
-        "检查项2：具体可验证的陈述"
-      ]
-    }}
-  ]
-}}
+Output format example:
+Support user registration and login
+Search response time less than 5 seconds
+Use SSL encryption for transmission
+Support multi-language interface
+Data backup mechanism
+Error handling mechanism
 
-文档内容：
+Document content:
 {document_content}
 
-请提取要点清单，只输出JSON，不要有任何其他文字说明。
-
+Please extract the checkpoint list, one checkpoint per line, output only the checkpoint content, without any other explanatory text.

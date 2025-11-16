@@ -120,10 +120,10 @@ uv run main.py --baseline baseline.md --target target1.md --force-extract
 
 ### 多次提取取最优
 
-为了提高要点清单的完整性，可以多次提取并选择要点数量最多的结果：
+为了提高要点清单的完整性，可以多次提取并选择检查项数量最多的结果：
 
 ```bash
-# 执行3次提取，选择要点数量最多的结果
+# 执行3次提取，选择检查项数量最多的结果
 uv run main.py --baseline baseline.md --target target1.md --extract-runs 3
 
 # 结合强制重新提取使用
@@ -133,7 +133,7 @@ uv run main.py --baseline baseline.md --target target1.md --extract-runs 5 --for
 **工作原理**：
 - 执行指定次数的提取（例如3次）
 - 每次提取都会调用API获取要点清单
-- 自动选择要点数量最多的结果作为最终要点清单
+- 自动选择检查项数量最多的结果作为最终要点清单
 - 提取结果自动保存到缓存，后续运行直接使用缓存
 
 **优势**：
@@ -229,7 +229,7 @@ uv run main.py --baseline baseline.md --targets target1.md target2.md --max-work
 
 2. **多次提取取最优机制**：
    - 支持 `--extract-runs` 参数指定提取次数（默认1次）
-   - 多次提取后自动选择要点数量最多的结果
+   - 多次提取后自动选择检查项数量最多的结果
    - 确保提取到最完整、最全面的要点清单
    - 提取结果自动缓存，后续运行直接使用缓存
 
