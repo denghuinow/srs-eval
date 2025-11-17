@@ -633,6 +633,7 @@ def compare_algorithms_batch(
     file_extensions: List[str] = None,
     output_file: str = None,
     build_cache_only: bool = False,
+    command_args: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """批量对比文件夹中的文件
     
@@ -647,6 +648,7 @@ def compare_algorithms_batch(
         file_extensions: 要处理的文件扩展名列表
         output_file: 结果输出文件路径（可选）
         build_cache_only: 是否仅构建缓存（不执行评估）
+        command_args: 执行的命令参数字典（用于记录到报告中）
         
     Returns:
         汇总结果字典
@@ -771,7 +773,7 @@ def compare_algorithms_batch(
         if output_path.suffix.lower() == '.md':
             # 如果是.md文件，保存为Markdown格式，同时生成JSON
             save_results_to_markdown(
-                all_results, summary, output_file, baseline_dir, target_dir
+                all_results, summary, output_file, baseline_dir, target_dir, command_args
             )
             # 同时生成JSON文件
             json_path = output_path.with_suffix('.json')
@@ -779,6 +781,7 @@ def compare_algorithms_batch(
                 "timestamp": datetime.now().isoformat(),
                 "baseline_dir": str(baseline_dir),
                 "target_dir": str(target_dir),
+                "command_args": command_args or {},
                 "summary": summary,
                 "detailed_results": all_results,
             }
@@ -790,12 +793,12 @@ def compare_algorithms_batch(
         else:
             # 默认保存为JSON格式，同时生成Markdown
             save_results_to_file(
-                all_results, summary, output_file, baseline_dir, target_dir
+                all_results, summary, output_file, baseline_dir, target_dir, command_args
             )
             # 自动生成同名的Markdown文件
             md_path = output_path.with_suffix('.md')
             save_results_to_markdown(
-                all_results, summary, str(md_path), baseline_dir, target_dir
+                all_results, summary, str(md_path), baseline_dir, target_dir, command_args
             )
     
     return summary
@@ -942,6 +945,7 @@ def save_results_to_markdown(
     output_file: str,
     baseline_dir: Path,
     target_dir: Path,
+    command_args: Dict[str, Any] = None,
 ):
     """保存结果为Markdown格式
     
@@ -951,6 +955,7 @@ def save_results_to_markdown(
         output_file: 输出文件路径
         baseline_dir: 基准文件夹路径
         target_dir: 目标文件夹路径
+        command_args: 执行的命令参数字典（可选）
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -965,6 +970,25 @@ def save_results_to_markdown(
     lines.append(f"**基准文件夹**: `{baseline_dir}`")
     lines.append(f"**目标文件夹**: `{target_dir}`")
     lines.append("")
+    
+    # 添加命令参数部分
+    if command_args:
+        lines.append("## 执行命令参数")
+        lines.append("")
+        lines.append("| 参数 | 值 |")
+        lines.append("|------|-----|")
+        for key, value in sorted(command_args.items()):
+            if value is None:
+                display_value = "（默认）"
+            elif isinstance(value, bool):
+                display_value = "是" if value else "否"
+            elif isinstance(value, list):
+                display_value = ", ".join(str(v) for v in value) if value else "（无）"
+            else:
+                display_value = str(value)
+            lines.append(f"| {key} | `{display_value}` |")
+        lines.append("")
+    
     lines.append("---")
     lines.append("")
     
@@ -1142,6 +1166,7 @@ def save_results_to_file(
     output_file: str,
     baseline_dir: Path,
     target_dir: Path,
+    command_args: Dict[str, Any] = None,
     output_markdown: str = None,
 ):
     """保存结果到文件
@@ -1152,6 +1177,7 @@ def save_results_to_file(
         output_file: 输出文件路径（JSON格式）
         baseline_dir: 基准文件夹路径
         target_dir: 目标文件夹路径
+        command_args: 执行的命令参数字典（可选）
         output_markdown: Markdown输出文件路径（可选）
     """
     output_path = Path(output_file)
@@ -1162,6 +1188,7 @@ def save_results_to_file(
         "timestamp": datetime.now().isoformat(),
         "baseline_dir": str(baseline_dir),
         "target_dir": str(target_dir),
+        "command_args": command_args or {},
         "summary": summary,
         "detailed_results": all_results,
     }
@@ -1176,12 +1203,12 @@ def save_results_to_file(
     # 如果指定了Markdown输出，或者输出文件是.md格式，则同时生成Markdown
     if output_markdown:
         save_results_to_markdown(
-            all_results, summary, output_markdown, baseline_dir, target_dir
+            all_results, summary, output_markdown, baseline_dir, target_dir, command_args
         )
     elif output_path.suffix.lower() == '.md':
         # 如果输出文件是.md，则直接保存为Markdown格式
         save_results_to_markdown(
-            all_results, summary, output_file, baseline_dir, target_dir
+            all_results, summary, output_file, baseline_dir, target_dir, command_args
         )
         # 同时生成JSON文件（同名但扩展名为.json）
         json_path = output_path.with_suffix('.json')
@@ -1331,6 +1358,19 @@ if __name__ == "__main__":
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             args.output = f"compare_results_{timestamp}.json"
         
+        # 构建命令参数字典
+        command_args = {
+            "baseline": str(baseline),
+            "target": str(target),
+            "judges": judges,
+            "extract_runs": args.extract_runs,
+            "compare_count": args.compare_count,
+            "force_extract": args.force_extract,
+            "workers": args.workers,
+            "file_extensions": args.file_extensions,
+            "output": args.output,
+        }
+        
         compare_algorithms_batch(
             baseline,
             target,
@@ -1342,6 +1382,7 @@ if __name__ == "__main__":
             file_extensions=args.file_extensions,
             output_file=args.output,
             build_cache_only=False,
+            command_args=command_args,
         )
     else:
         # 单文件模式
