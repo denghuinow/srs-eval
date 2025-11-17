@@ -19,9 +19,6 @@ from src.document_parser import DocumentParser
 
 # 配置日志
 logger = logging.getLogger(__name__)
-CONTINUATION_PROMPT = (
-    "请继续完成上述内容，保持格式和风格一致。"
-)
 
 
 class MergeStrategy(str, Enum):
@@ -403,6 +400,9 @@ class Evaluator:
     ) -> tuple[str, str | None]:
         """
         如果模型因为达到max_tokens而提前结束，自动请求接续
+        
+        使用对话前缀续写方式：将已生成的内容作为 assistant 消息，设置 prefix: True，
+        让模型从该前缀继续生成，避免重复输出表头和上一行。
         """
         if finish_reason != "length":
             return accumulated_text, finish_reason
@@ -432,9 +432,23 @@ class Evaluator:
             logger.info(before_text)
             logger.info("=" * 80)
             
+            # 使用对话前缀续写：更新最后一个 assistant 消息，而不是追加新消息
             continuation_messages = copy.deepcopy(base_messages)
-            continuation_messages.append({"role": "assistant", "content": combined_text})
-            continuation_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+            # 如果最后一个消息是 assistant 消息，更新它；否则追加新的
+            if continuation_messages and continuation_messages[-1].get("role") == "assistant":
+                continuation_messages[-1] = {
+                    "role": "assistant",
+                    "content": combined_text,
+                    "prefix": True,
+                    "partial": True
+                }
+            else:
+                continuation_messages.append({
+                    "role": "assistant",
+                    "content": combined_text,
+                    "prefix": True,
+                    "partial": True
+                })
 
             continuation_params = {
                 k: v for k, v in api_params.items() if k != "messages"
