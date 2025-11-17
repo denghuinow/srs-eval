@@ -20,7 +20,7 @@ from src.document_parser import DocumentParser
 # 配置日志
 logger = logging.getLogger(__name__)
 CONTINUATION_PROMPT = (
-    "上次回答因为达到 max_tokens 限制被截断。请从中断处继续完整输出剩余内容，保持完全一致的格式，不要重复已经输出的内容。"
+    "请继续完成上述内容，保持格式和风格一致。"
 )
 
 
@@ -423,6 +423,15 @@ class Evaluator:
             logger.warning(
                 f"{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
             )
+            
+            # 记录接续前的内容（最后500字符）
+            preview_length = 500
+            before_text = combined_text[-preview_length:] if len(combined_text) > preview_length else combined_text
+            logger.info(f"接续前内容（最后{len(before_text)}字符，总长度{len(combined_text)}字符）:")
+            logger.info("=" * 80)
+            logger.info(before_text)
+            logger.info("=" * 80)
+            
             continuation_messages = copy.deepcopy(base_messages)
             continuation_messages.append({"role": "assistant", "content": combined_text})
             continuation_messages.append({"role": "user", "content": CONTINUATION_PROMPT})
@@ -454,8 +463,21 @@ class Evaluator:
                 logger.warning("接续响应为空，停止继续尝试")
                 break
 
+            # 记录接续后的内容
+            logger.info(f"接续后新增内容（长度: {len(extra_text)}字符）:")
+            logger.info("=" * 80)
+            logger.info(extra_text)
+            logger.info("=" * 80)
+
             combined_text += extra_text
             finish_reason = response.choices[0].finish_reason
+            
+            # 记录合并后的内容（最后500字符，用于验证接续是否连贯）
+            after_text = combined_text[-preview_length:] if len(combined_text) > preview_length else combined_text
+            logger.info(f"接续后合并内容（最后{len(after_text)}字符，总长度{len(combined_text)}字符）:")
+            logger.info("=" * 80)
+            logger.info(after_text)
+            logger.info("=" * 80)
 
         if finish_reason == "length":
             logger.warning(
