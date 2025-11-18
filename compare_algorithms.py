@@ -663,6 +663,14 @@ def compare_algorithms_batch(
             file_extensions=file_extensions,
         )
     
+    # 加载配置以获取模型名称
+    try:
+        config = load_config()
+        model_name = config.openai.model
+    except ValueError as e:
+        logger.warning(f"无法加载配置获取模型名称: {e}")
+        model_name = None
+    
     print("=" * 80)
     print("批量算法对比工具")
     print("=" * 80)
@@ -672,6 +680,8 @@ def compare_algorithms_batch(
     print(f"要点提取次数: {extract_runs}")
     print(f"比较次数: {compare_count}")
     print(f"并行工作线程数: {workers}")
+    if model_name:
+        print(f"OpenAI模型: {model_name}")
     if force_extract:
         print("⚠ 强制重新提取模式（忽略缓存）")
     print()
@@ -773,7 +783,7 @@ def compare_algorithms_batch(
         if output_path.suffix.lower() == '.md':
             # 如果是.md文件，保存为Markdown格式，同时生成JSON
             save_results_to_markdown(
-                all_results, summary, output_file, baseline_dir, target_dir, command_args
+                all_results, summary, output_file, baseline_dir, target_dir, command_args, model_name
             )
             # 同时生成JSON文件
             json_path = output_path.with_suffix('.json')
@@ -781,6 +791,7 @@ def compare_algorithms_batch(
                 "timestamp": datetime.now().isoformat(),
                 "baseline_dir": str(baseline_dir),
                 "target_dir": str(target_dir),
+                "model_name": model_name,
                 "command_args": command_args or {},
                 "summary": summary,
                 "detailed_results": all_results,
@@ -793,12 +804,12 @@ def compare_algorithms_batch(
         else:
             # 默认保存为JSON格式，同时生成Markdown
             save_results_to_file(
-                all_results, summary, output_file, baseline_dir, target_dir, command_args
+                all_results, summary, output_file, baseline_dir, target_dir, command_args, None, model_name
             )
             # 自动生成同名的Markdown文件
             md_path = output_path.with_suffix('.md')
             save_results_to_markdown(
-                all_results, summary, str(md_path), baseline_dir, target_dir, command_args
+                all_results, summary, str(md_path), baseline_dir, target_dir, command_args, model_name
             )
     
     return summary
@@ -946,6 +957,7 @@ def save_results_to_markdown(
     baseline_dir: Path,
     target_dir: Path,
     command_args: Dict[str, Any] = None,
+    model_name: str = None,
 ):
     """保存结果为Markdown格式
     
@@ -956,6 +968,7 @@ def save_results_to_markdown(
         baseline_dir: 基准文件夹路径
         target_dir: 目标文件夹路径
         command_args: 执行的命令参数字典（可选）
+        model_name: 使用的OpenAI模型名称（可选）
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -969,6 +982,8 @@ def save_results_to_markdown(
     lines.append("")
     lines.append(f"**基准文件夹**: `{baseline_dir}`")
     lines.append(f"**目标文件夹**: `{target_dir}`")
+    if model_name:
+        lines.append(f"**OpenAI模型**: `{model_name}`")
     lines.append("")
     
     # 添加命令参数部分
@@ -1168,6 +1183,7 @@ def save_results_to_file(
     target_dir: Path,
     command_args: Dict[str, Any] = None,
     output_markdown: str = None,
+    model_name: str = None,
 ):
     """保存结果到文件
     
@@ -1179,6 +1195,7 @@ def save_results_to_file(
         target_dir: 目标文件夹路径
         command_args: 执行的命令参数字典（可选）
         output_markdown: Markdown输出文件路径（可选）
+        model_name: 使用的OpenAI模型名称（可选）
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1188,6 +1205,7 @@ def save_results_to_file(
         "timestamp": datetime.now().isoformat(),
         "baseline_dir": str(baseline_dir),
         "target_dir": str(target_dir),
+        "model_name": model_name,
         "command_args": command_args or {},
         "summary": summary,
         "detailed_results": all_results,
@@ -1203,12 +1221,12 @@ def save_results_to_file(
     # 如果指定了Markdown输出，或者输出文件是.md格式，则同时生成Markdown
     if output_markdown:
         save_results_to_markdown(
-            all_results, summary, output_markdown, baseline_dir, target_dir, command_args
+            all_results, summary, output_markdown, baseline_dir, target_dir, command_args, model_name
         )
     elif output_path.suffix.lower() == '.md':
         # 如果输出文件是.md，则直接保存为Markdown格式
         save_results_to_markdown(
-            all_results, summary, output_file, baseline_dir, target_dir, command_args
+            all_results, summary, output_file, baseline_dir, target_dir, command_args, model_name
         )
         # 同时生成JSON文件（同名但扩展名为.json）
         json_path = output_path.with_suffix('.json')

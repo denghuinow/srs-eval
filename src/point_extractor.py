@@ -271,7 +271,7 @@ class PointExtractor:
                     choice = Choice(
                         index=0,
                         message=message,
-                        finish_reason=finish_reason
+                        finish_reason=finish_reason or "stop"
                     )
                     response = ChatCompletion(
                         id=chunk_id,
