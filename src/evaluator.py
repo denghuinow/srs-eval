@@ -403,11 +403,64 @@ class Evaluator:
         
         使用对话前缀续写方式：将已生成的内容作为 assistant 消息，设置 prefix: True，
         让模型从该前缀继续生成，避免重复输出表头和上一行。
+        
+        除了检查finish_reason == "length"外，还会检测CSV格式的响应是否被截断
+        （例如最后一行不完整）。
         """
-        if finish_reason != "length":
+        # 检查是否需要接续：finish_reason为"length"或检测到CSV格式被截断
+        needs_continuation = False
+        truncation_reason = None
+        
+        if finish_reason == "length":
+            needs_continuation = True
+            truncation_reason = "finish_reason为'length'"
+        else:
+            # 检测CSV格式是否被截断：检查最后一行是否完整
+            # CSV格式应该是：Index,Reason,Result 或 索引编号,判定理由,判定结果
+            # 完整行应该有3列，且最后一行应该以yes或no结尾
+            cleaned_text = self._extract_text_from_markdown(accumulated_text)
+            if cleaned_text:
+                lines = cleaned_text.strip().split('\n')
+                if len(lines) > 1:  # 至少有表头和数据行
+                    # 检查最后一行是否完整
+                    last_line = lines[-1].strip()
+                    if last_line:
+                        # 尝试解析最后一行
+                        try:
+                            reader = csv.reader([last_line])
+                            fields = next(reader)
+                            # 如果最后一行字段数少于3，或者不以yes/no结尾，可能被截断
+                            if len(fields) < 3:
+                                needs_continuation = True
+                                truncation_reason = f"最后一行字段数不足（{len(fields)}/3）"
+                            elif len(fields) == 3:
+                                # 检查Result列是否有值
+                                result_value = fields[2].strip().lower() if len(fields) > 2 else ""
+                                if not result_value or result_value not in ["yes", "no", "y", "n", "是", "否"]:
+                                    # 如果Result列为空或格式不对，可能被截断
+                                    needs_continuation = True
+                                    truncation_reason = f"最后一行Result列格式异常: '{result_value}'"
+                        except Exception:
+                            # 解析失败，可能格式有问题，尝试其他检测方法
+                            # 检查是否以引号开始但未结束（可能被截断）
+                            if last_line.count('"') % 2 != 0:
+                                needs_continuation = True
+                                truncation_reason = "最后一行引号未闭合"
+                            # 检查是否以逗号结尾（可能是被截断的字段）
+                            elif last_line.endswith(','):
+                                needs_continuation = True
+                                truncation_reason = "最后一行以逗号结尾，可能被截断"
+        
+        if not needs_continuation:
             return accumulated_text, finish_reason
+        
+        logger.warning(
+            f"{task_name} 检测到响应可能被截断（{truncation_reason}），"
+            f"finish_reason: {finish_reason}，尝试自动接续..."
+        )
+        
         if self.config.openai.max_continuations <= 0:
-            logger.warning(f"{task_name} 输出因max_tokens被截断，但未开启接续功能")
+            logger.warning(f"{task_name} 输出被截断，但未开启接续功能")
             return accumulated_text, finish_reason
         base_messages = api_params.get("messages")
         if not base_messages:
@@ -418,7 +471,8 @@ class Evaluator:
         attempt = 0
         total_attempts = self.config.openai.max_continuations
 
-        while finish_reason == "length" and attempt < total_attempts:
+        # 继续接续直到不再需要（finish_reason不是"length"且CSV格式完整）
+        while attempt < total_attempts:
             attempt += 1
             logger.warning(
                 f"{task_name} 响应达到 max_tokens，自动发送第 {attempt}/{total_attempts} 次接续请求..."
@@ -485,6 +539,7 @@ class Evaluator:
 
             combined_text += extra_text
             finish_reason = response.choices[0].finish_reason
+            logger.debug(f"接续后 finish_reason: {finish_reason}")
             
             # 记录合并后的内容（最后500字符，用于验证接续是否连贯）
             after_text = combined_text[-preview_length:] if len(combined_text) > preview_length else combined_text
@@ -492,6 +547,50 @@ class Evaluator:
             logger.info("=" * 80)
             logger.info(after_text)
             logger.info("=" * 80)
+            
+            # 检查接续后是否还需要继续接续
+            still_needs_continuation = False
+            
+            if finish_reason == "length":
+                # finish_reason是"length"，需要继续接续
+                still_needs_continuation = True
+            else:
+                # finish_reason不是"length"，但需要检查CSV格式是否完整
+                cleaned_text = self._extract_text_from_markdown(combined_text)
+                if cleaned_text:
+                    lines = cleaned_text.strip().split('\n')
+                    if len(lines) > 1:
+                        last_line = lines[-1].strip()
+                        if last_line:
+                            try:
+                                reader = csv.reader([last_line])
+                                fields = next(reader)
+                                if len(fields) >= 3:
+                                    result_value = fields[2].strip().lower() if len(fields) > 2 else ""
+                                    if result_value in ["yes", "no", "y", "n", "是", "否"]:
+                                        # CSV格式完整，不需要继续接续
+                                        logger.info(f"接续后CSV格式已完整，停止接续")
+                                        still_needs_continuation = False
+                                    else:
+                                        # Result列格式不对，可能还需要接续
+                                        still_needs_continuation = True
+                                        logger.debug(f"接续后最后一行Result列格式仍异常: '{result_value}'，继续接续")
+                                else:
+                                    # 字段数不足，需要继续接续
+                                    still_needs_continuation = True
+                                    logger.debug(f"接续后最后一行字段数仍不足（{len(fields)}/3），继续接续")
+                            except Exception as e:
+                                # 解析失败，检查其他截断特征
+                                if last_line.count('"') % 2 != 0 or last_line.endswith(','):
+                                    still_needs_continuation = True
+                                    logger.debug(f"接续后最后一行仍有截断特征，继续接续: {e}")
+                                else:
+                                    # 无法判断，假设已完成
+                                    still_needs_continuation = False
+            
+            # 如果不需要继续接续，退出循环
+            if not still_needs_continuation:
+                break
 
         if finish_reason == "length":
             logger.warning(
@@ -604,6 +703,7 @@ class Evaluator:
         # 解析响应
         result_text = response.choices[0].message.content
         finish_reason = response.choices[0].finish_reason
+        logger.debug(f"API响应 finish_reason: {finish_reason}")
         if not result_text:
             # 尝试获取更多信息
             error_msg = f"API返回结果为空"

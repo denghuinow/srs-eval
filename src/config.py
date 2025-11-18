@@ -18,9 +18,9 @@ class OpenAIConfig(BaseModel):
     )
     temperature: float = Field(default=0.0, description="温度参数，固定为0确保可重复性")
     max_tokens: Optional[int] = Field(default=None, description="最大token数，None时使用API默认值")
-    timeout: float = Field(default=900.0, description="API调用超时时间（秒）")
-    max_retries: int = Field(default=3, description="最大重试次数")
-    retry_delay: float = Field(default=1.0, description="重试延迟初始值（秒），使用指数退避")
+    timeout: float = Field(default=1800.0, description="API调用超时时间（秒）")
+    max_retries: int = Field(default=5, description="最大重试次数")
+    retry_delay: float = Field(default=8.0, description="重试延迟初始值（秒），使用指数退避")
     stream: bool = Field(default=True, description="是否启用流式响应")
     max_continuations: int = Field(
         default=2, description="当因max_tokens导致输出被截断时自动请求接续的次数上限"
