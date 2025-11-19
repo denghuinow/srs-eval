@@ -121,6 +121,35 @@ def setup_logging():
 logger = setup_logging()
 
 
+def find_matching_baseline(target_file: Path, baseline_dir: Path) -> Path | None:
+    """根据目标文档文件名查找匹配的基准文档
+    
+    Args:
+        target_file: 目标文档路径
+        baseline_dir: 基准文档目录
+        
+    Returns:
+        匹配的基准文档路径，如果未找到则返回None
+    """
+    target_stem = target_file.stem  # 不含扩展名的文件名
+    
+    # 1. 完全匹配文件名（忽略扩展名）
+    for ext in ['.md', '.txt', '.markdown']:
+        baseline_path = baseline_dir / f"{target_stem}{ext}"
+        if baseline_path.exists() and baseline_path.is_file():
+            return baseline_path
+    
+    # 2. 尝试在基准目录中查找包含目标文件名的文件
+    for baseline_file in baseline_dir.glob("*"):
+        if baseline_file.is_file():
+            baseline_stem = baseline_file.stem
+            # 如果基准文件名包含目标文件名，或者目标文件名包含基准文件名
+            if target_stem in baseline_stem or baseline_stem in target_stem:
+                return baseline_file
+    
+    return None
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
@@ -205,11 +234,17 @@ def main():
         logger.error(f"配置错误: {e}")
         sys.exit(1)
 
+    # 记录总开始时间
+    total_start_time = time.time()
+
     # 确定评委数量
     judges = args.judges if args.judges is not None else config.eval.default_runs
 
-    # 确定基准文档
+    # 确定基准文档或基准文档目录
     baseline_path = None
+    baseline_dir = None
+    use_matching_mode = False  # 是否使用匹配模式（为每个目标文档匹配对应的基准文档）
+    
     if args.baseline:
         baseline_path = Path(args.baseline)
         if not baseline_path.exists():
@@ -226,13 +261,18 @@ def main():
         if not baseline_dir.is_dir():
             logger.error(f"基准文档路径不是文件夹: {args.baseline_dir}")
             sys.exit(1)
-        # 扫描文件夹中的第一个 .md 文件
-        md_files = sorted(baseline_dir.glob("*.md")) + sorted(baseline_dir.glob("*.markdown"))
-        if not md_files:
-            logger.error(f"基准文档文件夹中没有找到 .md 文件: {args.baseline_dir}")
-            sys.exit(1)
-        baseline_path = md_files[0]
-        logger.info(f"从基准文档文件夹中选择: {baseline_path.name}")
+        # 检查是否同时指定了目标文档目录，如果是，则使用匹配模式
+        if args.target_dir:
+            use_matching_mode = True
+            logger.info(f"使用匹配模式：将为每个目标文档匹配对应的基准文档")
+        else:
+            # 如果没有指定目标文档目录，则使用第一个 .md 文件作为基准文档
+            md_files = sorted(baseline_dir.glob("*.md")) + sorted(baseline_dir.glob("*.markdown"))
+            if not md_files:
+                logger.error(f"基准文档文件夹中没有找到 .md 文件: {args.baseline_dir}")
+                sys.exit(1)
+            baseline_path = md_files[0]
+            logger.info(f"从基准文档文件夹中选择: {baseline_path.name}")
 
     # 确定待评估文档列表
     target_paths = []
@@ -265,47 +305,62 @@ def main():
             logger.error(f"待评估文档路径不是文件: {target_path}")
             sys.exit(1)
 
-    logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
-    logger.info("-" * 60)
+    # 如果不是匹配模式，则从单个基准文档提取要点清单
+    if not use_matching_mode:
+        logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
+        logger.info("-" * 60)
 
-    # 提取要点清单
-    try:
+        # 提取要点清单
+        try:
+            extractor = PointExtractor(config)
+            logger.info(f"使用模型: {config.openai.model}")
+            logger.info(f"API地址: {config.openai.base_url}")
+            
+            if args.force_extract:
+                logger.info("⚠ 强制重新提取模式（忽略缓存）")
+            else:
+                logger.info("ℹ 使用缓存机制（如果存在）")
+            
+            if args.extract_runs > 1:
+                logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择检查项数量最多的结果")
+            
+            checkpoints = extractor.extract_points(
+                baseline_path,
+                force_extract=args.force_extract,
+                extract_runs=args.extract_runs,
+            )
+            
+            logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
+            logger.info("")
+        except Exception as e:
+            logger.error(f"提取要点失败: {e}")
+            logger.debug(f"调试信息:", exc_info=True)
+            logger.debug(f"  - 基准文档: {baseline_path}")
+            logger.debug(f"  - 文档是否存在: {baseline_path.exists()}")
+            if baseline_path.exists():
+                try:
+                    from src.document_parser import DocumentParser
+                    parser = DocumentParser()
+                    content = parser.read_markdown(baseline_path)
+                    logger.debug(f"  - 文档大小: {len(content)} 字符")
+                except Exception as e2:
+                    logger.debug(f"  - 读取文档失败: {e2}")
+            logger.debug(f"  - 模型: {config.openai.model}")
+            logger.debug(f"  - API地址: {config.openai.base_url}")
+            sys.exit(1)
+    else:
+        # 匹配模式：不在这里提取要点清单，而是为每个目标文档单独提取
+        checkpoints = None
         extractor = PointExtractor(config)
         logger.info(f"使用模型: {config.openai.model}")
         logger.info(f"API地址: {config.openai.base_url}")
-        
         if args.force_extract:
             logger.info("⚠ 强制重新提取模式（忽略缓存）")
         else:
             logger.info("ℹ 使用缓存机制（如果存在）")
-        
         if args.extract_runs > 1:
             logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择检查项数量最多的结果")
-        
-        checkpoints = extractor.extract_points(
-            baseline_path,
-            force_extract=args.force_extract,
-            extract_runs=args.extract_runs,
-        )
-        
-        logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
         logger.info("")
-    except Exception as e:
-        logger.error(f"提取要点失败: {e}")
-        logger.debug(f"调试信息:", exc_info=True)
-        logger.debug(f"  - 基准文档: {baseline_path}")
-        logger.debug(f"  - 文档是否存在: {baseline_path.exists()}")
-        if baseline_path.exists():
-            try:
-                from src.document_parser import DocumentParser
-                parser = DocumentParser()
-                content = parser.read_markdown(baseline_path)
-                logger.debug(f"  - 文档大小: {len(content)} 字符")
-            except Exception as e2:
-                logger.debug(f"  - 读取文档失败: {e2}")
-        logger.debug(f"  - 模型: {config.openai.model}")
-        logger.debug(f"  - API地址: {config.openai.base_url}")
-        sys.exit(1)
 
     # 评估文档（支持并行执行）
     evaluator = Evaluator(config)
@@ -328,19 +383,43 @@ def main():
     def evaluate_document(target_path: Path) -> tuple[Path, DocumentEvaluation | None]:
         """评估单个文档的函数，用于并行执行"""
         try:
+            # 如果是匹配模式，为每个目标文档找到对应的基准文档
+            doc_baseline_path = baseline_path
+            doc_checkpoints = checkpoints
+            
+            if use_matching_mode:
+                # 查找匹配的基准文档
+                matched_baseline = find_matching_baseline(target_path, baseline_dir)
+                if matched_baseline is None:
+                    logger.warning(f"未找到 {target_path.name} 的匹配基准文档，跳过评估")
+                    return (target_path, None)
+                doc_baseline_path = matched_baseline
+                
+                # 从对应的基准文档提取检查项清单
+                try:
+                    doc_checkpoints = extractor.extract_points(
+                        doc_baseline_path,
+                        force_extract=args.force_extract,
+                        extract_runs=args.extract_runs,
+                    )
+                except Exception as e:
+                    logger.error(f"从基准文档 {doc_baseline_path.name} 提取要点失败: {e}")
+                    logger.debug(f"提取要点失败详情:", exc_info=True)
+                    return (target_path, None)
+            
             if judges > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
-                    checkpoints, target_path, runs=judges, baseline_document_path=baseline_path
+                    doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
                 )
             else:
                 # 记录开始时间
                 start_time = time.time()
                 evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
+                evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
                 # 为单次评估也添加元信息
                 evaluation.model_name = config.openai.model
-                evaluation.baseline_document = str(baseline_path)
+                evaluation.baseline_document = str(doc_baseline_path)
                 evaluation.evaluation_time = evaluation_time
                 evaluation.evaluation_duration = time.time() - start_time
             return (target_path, evaluation)
@@ -366,8 +445,12 @@ def main():
                 target_path, evaluation = future.result()
                 if evaluation is not None:
                     evaluations.append(evaluation)
+                    baseline_info = ""
+                    if use_matching_mode and evaluation.baseline_document:
+                        baseline_name = Path(evaluation.baseline_document).name
+                        baseline_info = f" (基准: {baseline_name})"
                     logger.info(
-                        f"[{completed}/{len(target_paths)}] ✓ {target_path.name} - "
+                        f"[{completed}/{len(target_paths)}] ✓ {target_path.name}{baseline_info} - "
                         f"完整性: {evaluation.completeness:.2f}, "
                         f"准确性: {evaluation.accuracy:.2f}, "
                         f"综合: {evaluation.comprehensive:.2f}"
@@ -379,20 +462,48 @@ def main():
             logger.info(f"正在评估文档: {target_path}")
             if judges > 1:
                 logger.info(f"评委数量: {judges}")
+            
+            # 如果是匹配模式，为每个目标文档找到对应的基准文档
+            doc_baseline_path = baseline_path
+            doc_checkpoints = checkpoints
+            
+            if use_matching_mode:
+                # 查找匹配的基准文档
+                matched_baseline = find_matching_baseline(target_path, baseline_dir)
+                if matched_baseline is None:
+                    logger.warning(f"未找到 {target_path.name} 的匹配基准文档，跳过评估")
+                    continue
+                doc_baseline_path = matched_baseline
+                logger.info(f"匹配的基准文档: {doc_baseline_path.name}")
+                
+                # 从对应的基准文档提取检查项清单
+                try:
+                    logger.info(f"正在从基准文档提取要点清单: {doc_baseline_path.name}")
+                    doc_checkpoints = extractor.extract_points(
+                        doc_baseline_path,
+                        force_extract=args.force_extract,
+                        extract_runs=args.extract_runs,
+                    )
+                    logger.info(f"✓ 检查项清单：共 {len(doc_checkpoints)} 个检查项")
+                except Exception as e:
+                    logger.error(f"从基准文档 {doc_baseline_path.name} 提取要点失败: {e}")
+                    logger.debug(f"提取要点失败详情:", exc_info=True)
+                    continue
+            
             try:
                 if judges > 1:
                     evaluation = evaluator.evaluate_multiple_runs(
-                        checkpoints, target_path, runs=judges, baseline_document_path=baseline_path
+                        doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
                     )
                 else:
                     # 记录开始时间
                     start_time = time.time()
                     evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
+                    evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
                     # 为单次评估也添加元信息
                     evaluation.model_name = config.openai.model
-                    evaluation.baseline_document = str(baseline_path)
+                    evaluation.baseline_document = str(doc_baseline_path)
                     evaluation.evaluation_time = evaluation_time
                     evaluation.evaluation_duration = time.time() - start_time
 
@@ -444,7 +555,24 @@ def main():
         logger.info("")
         logger.info("正在生成聚合统计报告...")
         summary_path = output_dir / "summary_report.md"
-        formatter.save_summary_report(evaluations, summary_path, baseline_path)
+        total_time = time.time() - total_start_time
+        # 确定target_dir和baseline_dir
+        target_dir_path = None
+        if args.target_dir:
+            target_dir_path = Path(args.target_dir)
+        baseline_dir_path = None
+        if args.baseline_dir:
+            baseline_dir_path = Path(args.baseline_dir)
+        formatter.save_summary_report(
+            evaluations, 
+            summary_path, 
+            baseline_path,
+            target_dir=target_dir_path,
+            baseline_dir=baseline_dir_path,
+            output_dir=output_dir,
+            judges=judges,
+            total_time=total_time,
+        )
         logger.info(f"✓ 聚合统计报告: {summary_path}")
 
     logger.info("")
