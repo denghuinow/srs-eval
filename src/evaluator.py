@@ -627,8 +627,41 @@ class Evaluator:
 
             extra_text = response.choices[0].message.content or ""
             if not extra_text:
-                logger.warning("接续响应为空，停止继续尝试")
-                break
+                logger.warning("接续响应为空，重新发起原始请求")
+                # 重新使用原始api_params发起请求，而不是继续接续
+                start_time = time.time()
+                response = self._call_api_with_retry(api_params)
+                elapsed = time.time() - start_time
+                logger.info(f"重新发起原始请求完成，耗时: {elapsed:.2f}秒")
+                
+                if not response or not response.choices:
+                    logger.warning("重新发起的原始请求返回无效响应，停止继续尝试")
+                    break
+                
+                if hasattr(response, "usage") and response.usage:
+                    usage = response.usage
+                    logger.info(
+                        f"重新请求 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                        f"completion_tokens: {usage.completion_tokens}, "
+                        f"total_tokens: {usage.total_tokens}"
+                    )
+                
+                # 使用重新请求的完整响应替换accumulated_text
+                new_text = response.choices[0].message.content or ""
+                if new_text:
+                    combined_text = new_text
+                    finish_reason = response.choices[0].finish_reason
+                    logger.info(f"重新请求获得响应，长度: {len(new_text)}字符，finish_reason: {finish_reason}")
+                    # 重新检查是否需要继续接续
+                    if finish_reason == "length":
+                        # 如果重新请求后仍然被截断，继续接续循环
+                        continue
+                    else:
+                        # 重新请求后完成，退出循环
+                        break
+                else:
+                    logger.warning("重新发起的原始请求响应仍为空，停止继续尝试")
+                    break
 
             # 记录接续后的内容
             logger.info(f"接续后新增内容（长度: {len(extra_text)}字符）:")
@@ -691,10 +724,39 @@ class Evaluator:
             if not still_needs_continuation:
                 break
 
+        # 如果达到最大尝试次数后仍然被截断，重新发起原始请求
         if finish_reason == "length":
             logger.warning(
-                f"{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，输出可能不完整"
+                f"{task_name} 在尝试 {total_attempts} 次后仍被max_tokens截断，重新发起原始请求"
             )
+            # 重新使用原始api_params发起请求
+            start_time = time.time()
+            response = self._call_api_with_retry(api_params)
+            elapsed = time.time() - start_time
+            logger.info(f"8次接续后重新发起原始请求完成，耗时: {elapsed:.2f}秒")
+            
+            if response and response.choices:
+                if hasattr(response, "usage") and response.usage:
+                    usage = response.usage
+                    logger.info(
+                        f"重新请求 Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                        f"completion_tokens: {usage.completion_tokens}, "
+                        f"total_tokens: {usage.total_tokens}"
+                    )
+                
+                new_text = response.choices[0].message.content or ""
+                if new_text:
+                    combined_text = new_text
+                    finish_reason = response.choices[0].finish_reason
+                    logger.info(f"重新请求获得响应，长度: {len(new_text)}字符，finish_reason: {finish_reason}")
+                    if finish_reason == "length":
+                        logger.warning(
+                            f"{task_name} 重新请求后仍被max_tokens截断，输出可能不完整"
+                        )
+                else:
+                    logger.warning(f"{task_name} 重新请求后响应为空，输出可能不完整")
+            else:
+                logger.warning(f"{task_name} 重新请求返回无效响应，输出可能不完整")
 
         return combined_text, finish_reason
 
