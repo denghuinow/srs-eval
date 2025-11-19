@@ -48,3 +48,4 @@ output/
 # uv
 .uv/
 logs/
+test/

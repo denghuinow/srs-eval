@@ -4,7 +4,9 @@ import argparse
 import logging
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -277,10 +279,19 @@ def main():
         try:
             if judges > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
-                    checkpoints, target_path, runs=judges
+                    checkpoints, target_path, runs=judges, baseline_document_path=baseline_path
                 )
             else:
+                # 记录开始时间
+                start_time = time.time()
+                evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
                 evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
+                # 为单次评估也添加元信息
+                evaluation.model_name = config.openai.model
+                evaluation.baseline_document = str(baseline_path)
+                evaluation.evaluation_time = evaluation_time
+                evaluation.evaluation_duration = time.time() - start_time
             return (target_path, evaluation)
         except Exception as e:
             logger.error(f"评估文档 {target_path} 失败: {e}")
@@ -320,10 +331,19 @@ def main():
             try:
                 if judges > 1:
                     evaluation = evaluator.evaluate_multiple_runs(
-                        checkpoints, target_path, runs=judges
+                        checkpoints, target_path, runs=judges, baseline_document_path=baseline_path
                     )
                 else:
+                    # 记录开始时间
+                    start_time = time.time()
+                    evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
                     evaluation = evaluator.evaluate_single_run(checkpoints, target_path)
+                    # 为单次评估也添加元信息
+                    evaluation.model_name = config.openai.model
+                    evaluation.baseline_document = str(baseline_path)
+                    evaluation.evaluation_time = evaluation_time
+                    evaluation.evaluation_duration = time.time() - start_time
 
                 evaluations.append(evaluation)
                 logger.info(

@@ -25,6 +25,9 @@ class OpenAIConfig(BaseModel):
     max_continuations: int = Field(
         default=2, description="当因max_tokens导致输出被截断时自动请求接续的次数上限"
     )
+    max_parse_retries: int = Field(
+        default=2, description="当解析TSV结果失败时，重新请求API的最大重试次数"
+    )
 
 
 class EvalConfig(BaseModel):
@@ -62,6 +65,9 @@ def load_config() -> Config:
     max_continuations = int(os.getenv("MAX_CONTINUATIONS", "2"))
     if max_continuations < 0:
         max_continuations = 0
+    max_parse_retries = int(os.getenv("MAX_PARSE_RETRIES", "2"))
+    if max_parse_retries < 0:
+        max_parse_retries = 0
 
     openai_config = OpenAIConfig(
         api_key=api_key,
@@ -74,6 +80,7 @@ def load_config() -> Config:
         retry_delay=float(os.getenv("OPENAI_RETRY_DELAY", "1.0")),
         stream=os.getenv("OPENAI_STREAM", "true").lower() in ("true", "1", "yes"),
         max_continuations=max_continuations,
+        max_parse_retries=max_parse_retries,
     )
 
     eval_config = EvalConfig(

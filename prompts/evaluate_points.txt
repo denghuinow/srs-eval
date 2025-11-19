@@ -12,9 +12,9 @@ You are a professional requirements document evaluation expert. Your task is to:
    * If not found: Explicitly state the specific content of the checkpoint and explain "No explicit description directly related to [specific checkpoint content] was found in the document".
    
    **Examples**:
-   - ❌ Wrong: `No explicit description directly related to this checkpoint was found in the document`
-   - ✅ Correct: `No explicit description directly related to "support user login functionality" was found in the document`
-   - ✅ Correct: `No explicit description supporting user login functionality was found in the document`
+   - Wrong: `No explicit description directly related to this checkpoint was found in the document`
+   - Correct: `No explicit description directly related to "support user login functionality" was found in the document`
+   - Correct: `No explicit description supporting user login functionality was found in the document`
 6. **Binary judgment**:
    
    * Use `yes` to indicate that explicit content corresponding to the checkpoint was found in the document;
@@ -23,63 +23,67 @@ You are a professional requirements document evaluation expert. Your task is to:
 
 ### Output Format Requirements (Important! Must strictly comply)
 
-**⚠️ Format requirements are mandatory, any deviation will cause parsing to fail!**
+**WARNING: Format requirements are mandatory, any deviation will cause parsing to fail!**
 
-1. **Must wrap CSV output in code blocks**, format as follows:
+1. **Must wrap TSV output in code blocks**, format as follows:
    
-   ```csv
-   Index,Reason,Result
-   0,The document explicitly describes content related to "support user registration functionality", including form validation and user information storage,yes
-   1,No explicit description directly related to "support user login functionality" was found in the document,no
+   ```tsv
+   Index	Reason	Result
+   0	The document explicitly describes content related to "support user registration functionality" including form validation and user information storage	yes
+   1	No explicit description directly related to "support user login functionality" was found in the document	no
    ```
 
-2. **CSV format requirements**:
-   - Use English comma `,` as column separator
-   - **The first line must be the header**, and must be exactly (must be completely consistent, no variations): `Index,Reason,Result`
-   - **Starting from the second line, each line must contain three columns**, corresponding to one checkpoint in the checkpoint list
+2. **TSV format requirements**:
+   - Use **tab character (制表符)** as column separator (NOT comma, NOT space)
+   - **The first line must be the header**, and must be exactly (must be completely consistent, no variations): `Index	Reason	Result` (tabs between columns)
+   - **Starting from the second line, each line must contain three columns**, separated by tabs, corresponding to one checkpoint in the checkpoint list
 
 3. **Column requirements**:
    * **First column - Index**: Integer starting from `0`, incrementing sequentially according to checkpoint order (0, 1, 2, 3, ...).
-   * **Second column - Reason**: Brief explanation in English of findings in the document, or reason for not finding. To avoid breaking CSV structure, please do not use English commas `,` in the reason, you can use other separators if needed.
+   * **Second column - Reason**: Brief explanation in English of findings in the document, or reason for not finding. **You can freely use commas, semicolons, and other punctuation in this column** - tabs are only used as column separators.
    * **Third column - Result**: **Must** be `yes` or `no` (lowercase, no quotes, no spaces). **This column must absolutely not be omitted, cannot be empty, and cannot be other values!**
 
 4. **Format example** (please strictly follow this format for output, note that the reason must explicitly mention the specific content of the checkpoint):
    
-   ```csv
-   Index,Reason,Result
-   0,The document explicitly describes content related to "support user registration functionality", including form validation and user information storage,yes
-   1,No explicit description directly related to "support user login functionality" was found in the document,no
-   2,The document describes search functionality, but does not explicitly mention the specific requirements for "support advanced search functionality",no
+   ```tsv
+   Index	Reason	Result
+   0	The document explicitly describes content related to "support user registration functionality", including form validation and user information storage	yes
+   1	No explicit description directly related to "support user login functionality" was found in the document	no
+   2	The document explicitly describes API functions like `coem_send_data` and `coem_receive_data` for data transmission	yes
    ```
 
 5. **Key requirements**:
-   - ✅ **Must wrap the entire CSV content in ```csv code blocks**
-   - ✅ Each line must have three columns, separated by English commas
-   - ✅ The third column must be `yes` or `no`, cannot be omitted
-   - ✅ Must cover all checkpoints, no omissions or merging allowed
-   - ✅ Index must start from 0 and increment continuously
-   - ✅ **The reason must explicitly mention the specific content of the checkpoint**, cannot use vague expressions like "this checkpoint", "xxx checkpoint"
-   - ❌ Do not repeat words like "Reason" at the end of the reason
-   - ❌ Do not omit the Result column
-   - ❌ Do not use vague expressions like "this checkpoint", "with xxx checkpoint" in the output
-   - ❌ The output must not contain any additional text explanations, blank lines, or comments outside the code blocks
+   - **Must wrap the entire TSV content in ```tsv code blocks**
+   - Each line must have three columns, separated by **tab characters** (NOT commas)
+   - The third column must be `yes` or `no`, cannot be omitted
+   - Must cover all checkpoints, no omissions or merging allowed
+   - Index must start from 0 and increment continuously
+   - **The reason must explicitly mention the specific content of the checkpoint**, cannot use vague expressions like "this checkpoint", "xxx checkpoint"
+   - **Reason column can contain commas, semicolons, and any punctuation** - only tabs are used as separators
+   - Do not repeat words like "Reason" at the end of the reason
+   - Do not use commas as column separators
+   - Do not omit the Result column
+   - Do not use vague expressions like "this checkpoint", "with xxx checkpoint" in the output
+   - The output must not contain any additional text explanations, blank lines, or comments outside the code blocks
 
 6. **Pre-output check**: Before outputting, please confirm:
-   - Use ```csv code blocks to wrap
-   - The first line is the header: `Index,Reason,Result`
-   - Each line has three columns, the third column is `yes` or `no`
+   - Use ```tsv code blocks to wrap
+   - The first line is the header: `Index	Reason	Result` (with tabs)
+   - Each line has three columns, separated by tabs (NOT commas)
+   - The third column is `yes` or `no`
    - Index starts from 0 and increments continuously
    - **The reason explicitly mentions the specific content of the checkpoint**, no vague expressions like "this checkpoint" are used
    - No blank lines, no additional explanatory text
 
 ### Task
 
-Please evaluate the given checkpoint list and document content to be evaluated according to the above requirements, **use ```csv code blocks to wrap the final CSV table content**, and do not output any other text explanations or comments.
+Please evaluate the given checkpoint list and document content to be evaluated according to the above requirements, **use ```tsv code blocks to wrap the final TSV table content**, and do not output any other text explanations or comments.
 
-【Checkpoint List】:
-```csv
+[Checkpoint List]
+```tsv
+Index	Checkpoint
 {checkpoints_table}
 ```
 
-【Document Content to be Evaluated】:
+[Document Content to be Evaluated]
 {target_content}

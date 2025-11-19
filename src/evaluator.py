@@ -8,6 +8,7 @@ import logging
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -23,16 +24,8 @@ logger = logging.getLogger(__name__)
 
 class MergeStrategy(str, Enum):
     """合并策略枚举"""
-    AVERAGE = "average"  # 当前方法：平均值
-    MAJORITY = "majority"  # 多数投票（>50%）
-    CONSENSUS_67 = "consensus_67"  # 2/3一致性
-    CONSENSUS_75 = "consensus_75"  # 3/4一致性
-    MEDIAN = "median"  # 中位数：计算所有评委通过率的中位数
-    WEIGHTED = "weighted"  # 加权投票
-    CONFIDENCE = "confidence"  # 置信区间法
-    TRIMMED_MEAN = "trimmed_mean"  # 截断均值（去除最高和最低分后取平均）
-    QUANTILE_WEIGHTED = "quantile_weighted"  # 分位数加权（根据分数分布位置加权）
-    BAYESIAN_AVERAGE = "bayesian_average"  # 贝叶斯平均（结合先验信息）
+    CHECKPOINT_MAJORITY = "checkpoint_majority"  # 检查项合并：每个检查项按多数投票判定，再统计通过项占比
+    ACCURACY_AVERAGE = "accuracy_average"  # 准确性合并：对每个评委的通过项数量进行平均计算
 
 
 class CheckpointResult:
@@ -59,10 +52,26 @@ class DocumentEvaluation:
         target_document: str,
         checkpoints: list[str],
         checkpoint_results: list[CheckpointResult],
+        all_judge_results: list[list[CheckpointResult]] | None = None,
+        checkpoint_merge_result: "DocumentEvaluation | None" = None,
+        accuracy_merge_result: "DocumentEvaluation | None" = None,
+        model_name: str | None = None,
+        baseline_document: str | None = None,
     ):
         self.target_document = target_document
         self.checkpoints = checkpoints
         self.checkpoint_results = checkpoint_results
+        # 存储所有评委的检查项结果，用于显示每个评委的判断
+        # all_judge_results[i] 表示第 i 个评委对所有检查项的评估结果
+        self.all_judge_results = all_judge_results
+        # 存储两种策略的合并结果
+        self.checkpoint_merge_result = checkpoint_merge_result  # 检查项合并策略的结果
+        self.accuracy_merge_result = accuracy_merge_result  # 准确性合并策略的结果
+        # 评估元信息
+        self.model_name = model_name  # 使用的模型名称
+        self.baseline_document = baseline_document  # 基准文档路径
+        self.evaluation_time: str | None = None  # 评估时间
+        self.evaluation_duration: float | None = None  # 评估耗时（秒）
 
         # 计算分数
         total_checkpoints = len(checkpoints)
@@ -106,7 +115,8 @@ class Evaluator:
         从markdown代码块中提取文本内容
         
         处理以下情况：
-        - ```csv ... ```
+        - ```tsv ... ```
+        - ```csv ... ``` (兼容旧格式)
         - ``` ... ```
         - 纯文本（无代码块标记）
         
@@ -122,12 +132,12 @@ class Evaluator:
         
         text = text.strip()
         
-        # 尝试匹配 ```csv ... ``` 或 ``` ... ```
+        # 尝试匹配 ```tsv ... ``` 或 ```csv ... ``` 或 ``` ... ```
         if text.startswith("```"):
             # 找到第一个换行符（代码块开始标记之后）
             first_newline = text.find("\n")
             if first_newline != -1:
-                # 移除开始标记（```csv 或 ```）
+                # 移除开始标记（```tsv 或 ```csv 或 ```）
                 text = text[first_newline + 1:]
             
             # 找到最后一个 ```（代码块结束标记）
@@ -136,21 +146,48 @@ class Evaluator:
                 # 移除结束标记
                 text = text[:last_code_block]
         
+        # 清理后的文本可能包含代码块前的说明文字
+        # 查找TSV表头（Index\tReason\tResult 或 索引编号\t判定理由\t判定结果）
+        # 只保留从表头开始的内容
+        lines = text.split('\n')
+        header_found = False
+        header_index = -1
+        
+        # 查找表头行
+        for i, line in enumerate(lines):
+            line_lower = line.strip().lower()
+            # 检查是否是TSV表头
+            if (line_lower.startswith('index') and '\t' in line and 
+                ('reason' in line_lower or 'result' in line_lower)):
+                header_found = True
+                header_index = i
+                break
+            # 兼容中文表头
+            elif (('索引编号' in line or '索引' in line) and '\t' in line and 
+                  ('判定理由' in line or '判定结果' in line)):
+                header_found = True
+                header_index = i
+                break
+        
+        # 如果找到表头，只保留从表头开始的内容
+        if header_found and header_index >= 0:
+            text = '\n'.join(lines[header_index:])
+        
         return text.strip()
     
     @staticmethod
     def _format_checkpoints_as_csv(checkpoints: list[str]) -> str:
         """
-        将检查项列表格式化为CSV表格
+        将检查项列表格式化为TSV表格
         
         Args:
             checkpoints: 检查项列表
             
         Returns:
-            CSV格式的字符串，包含表头：索引编号,检查项内容
+            TSV格式的字符串，包含表头：Index	Checkpoint（使用制表符分隔）
         """
         output = io.StringIO()
-        writer = csv.writer(output)
+        writer = csv.writer(output, delimiter='\t')
         
         # 写入表头
         writer.writerow(["Index", "Checkpoint"])
@@ -162,30 +199,92 @@ class Evaluator:
         return output.getvalue()
     
     @staticmethod
-    def _parse_csv_result(csv_text: str, checkpoints: list[str]) -> list[CheckpointResult]:
+    def _validate_parse_result(
+        checkpoint_results: list[CheckpointResult], 
+        expected_count: int,
+        tsv_text: str = "",
+        min_valid_ratio: float = 0.3
+    ) -> tuple[bool, str]:
         """
-        解析CSV格式的评估结果
+        验证解析结果是否有效
+        
+        Args:
+            checkpoint_results: 解析得到的检查项结果列表
+            expected_count: 期望的检查项数量
+            tsv_text: 原始TSV文本（用于检查是否有数据行）
+            min_valid_ratio: 最小有效比例（默认0.3，即至少30%的检查项需要被正确解析）
+            
+        Returns:
+            (is_valid, error_message) 元组，is_valid为True表示解析结果有效，False表示无效
+        """
+        if len(checkpoint_results) != expected_count:
+            return False, f"检查项数量不匹配: 期望 {expected_count} 个，实际得到 {len(checkpoint_results)} 个"
+        
+        # 检查TSV文本中是否有数据行（除了表头）
+        if tsv_text:
+            lines = tsv_text.strip().split('\n')
+            # 至少应该有表头 + 1行数据
+            if len(lines) < 2:
+                return False, "TSV文本中没有数据行（只有表头）"
+            
+            # 检查是否有至少一行包含数字索引的数据行
+            has_data_row = False
+            for line in lines[1:]:  # 跳过表头
+                line = line.strip()
+                if not line:
+                    continue
+                # 检查是否以数字开头（可能是索引）
+                parts = line.split('\t')
+                if parts and parts[0].strip().isdigit():
+                    has_data_row = True
+                    break
+            
+            if not has_data_row:
+                return False, "TSV文本中没有有效的数字索引行"
+        
+        # 检查是否有足够的检查项被正确解析
+        # 这里我们检查是否有至少min_valid_ratio比例的检查项有明确的判定结果
+        # 由于我们改进了解析逻辑，现在即使Result列为空也会默认判定为False
+        # 所以只要数量匹配且有数据行就认为解析有效
+        return True, ""
+    
+    @staticmethod
+    def _parse_tsv_result(tsv_text: str, checkpoints: list[str]) -> list[CheckpointResult]:
+        """
+        解析TSV格式的评估结果
 
         Args:
-            csv_text: CSV格式的文本
+            tsv_text: TSV格式的文本
             checkpoints: 检查项列表（用于验证索引）
 
         Returns:
             检查项结果列表
         """
         # 处理 None 或空值的情况
-        if csv_text is None:
-            csv_text = ""
+        if tsv_text is None:
+            tsv_text = ""
         
-        # 使用csv模块解析
-        reader = csv.DictReader(io.StringIO(csv_text))
+        # 使用csv模块解析TSV（指定delimiter为制表符）
+        reader = csv.DictReader(io.StringIO(tsv_text), delimiter='\t')
 
         # 构建索引到结果的映射
         index_to_result = {}
         missing_result_count = 0
         for row in reader:
             try:
-                index = int(row.get("Index", row.get("索引编号", -1)))
+                # 跳过不符合格式的行（索引列不是数字或为空）
+                index_str = row.get("Index", row.get("索引编号", ""))
+                if not index_str or not index_str.strip():
+                    # 可能是说明文字行，跳过
+                    continue
+                
+                try:
+                    index = int(index_str)
+                except ValueError:
+                    # 索引列不是数字，可能是说明文字行，跳过
+                    logger.debug(f"跳过非数据行（索引列不是数字）: {row}")
+                    continue
+                
                 result_str_raw = row.get("Result", row.get("判定结果", ""))
                 result_str = (result_str_raw or "").strip().lower()
                 
@@ -195,10 +294,10 @@ class Evaluator:
                     if reason_str:
                         # 尝试从判定理由末尾提取 yes/no
                         reason_lower = reason_str.strip().lower()
-                        # 检查是否以 yes/no 结尾（可能用逗号分隔）
-                        if reason_lower.endswith(",yes") or reason_lower.endswith(" yes"):
+                        # 检查是否以 yes/no 结尾（可能用制表符分隔）
+                        if reason_lower.endswith("\tyes") or reason_lower.endswith(" yes"):
                             result_str = "yes"
-                        elif reason_lower.endswith(",no") or reason_lower.endswith(" no"):
+                        elif reason_lower.endswith("\tno") or reason_lower.endswith(" no"):
                             result_str = "no"
                         elif reason_lower.endswith("yes"):
                             result_str = "yes"
@@ -227,7 +326,7 @@ class Evaluator:
                 if 0 <= index < len(checkpoints):
                     index_to_result[index] = passed
             except (ValueError, KeyError) as e:
-                logger.warning(f"解析CSV行失败: {row}, 错误: {e}")
+                logger.warning(f"解析TSV行失败: {row}, 错误: {e}")
                 continue
         
         # 如果发现大量缺失的判定结果，给出警告
@@ -235,7 +334,7 @@ class Evaluator:
             logger.warning(
                 f"警告: 发现 {missing_result_count} 个检查项的判定结果列缺失或格式错误。"
                 f"这些检查项将被默认判定为未通过。"
-                f"请检查API返回的CSV格式是否正确，应包含三列：Index,Reason,Result (或 索引编号,判定理由,判定结果)"
+                f"请检查API返回的TSV格式是否正确，应包含三列：Index	Reason	Result (或 索引编号	判定理由	判定结果，使用制表符分隔)"
             )
 
         # 构建检查项结果列表
@@ -404,10 +503,10 @@ class Evaluator:
         使用对话前缀续写方式：将已生成的内容作为 assistant 消息，设置 prefix: True，
         让模型从该前缀继续生成，避免重复输出表头和上一行。
         
-        除了检查finish_reason == "length"外，还会检测CSV格式的响应是否被截断
+        除了检查finish_reason == "length"外，还会检测TSV格式的响应是否被截断
         （例如最后一行不完整）。
         """
-        # 检查是否需要接续：finish_reason为"length"或检测到CSV格式被截断
+        # 检查是否需要接续：finish_reason为"length"或检测到TSV格式被截断
         needs_continuation = False
         truncation_reason = None
         
@@ -415,8 +514,8 @@ class Evaluator:
             needs_continuation = True
             truncation_reason = "finish_reason为'length'"
         else:
-            # 检测CSV格式是否被截断：检查最后一行是否完整
-            # CSV格式应该是：Index,Reason,Result 或 索引编号,判定理由,判定结果
+            # 检测TSV格式是否被截断：检查最后一行是否完整
+            # TSV格式应该是：Index	Reason	Result 或 索引编号	判定理由	判定结果（使用制表符分隔）
             # 完整行应该有3列，且最后一行应该以yes或no结尾
             cleaned_text = self._extract_text_from_markdown(accumulated_text)
             if cleaned_text:
@@ -425,9 +524,9 @@ class Evaluator:
                     # 检查最后一行是否完整
                     last_line = lines[-1].strip()
                     if last_line:
-                        # 尝试解析最后一行
+                        # 尝试解析最后一行（使用制表符分隔）
                         try:
-                            reader = csv.reader([last_line])
+                            reader = csv.reader([last_line], delimiter='\t')
                             fields = next(reader)
                             # 如果最后一行字段数少于3，或者不以yes/no结尾，可能被截断
                             if len(fields) < 3:
@@ -555,7 +654,7 @@ class Evaluator:
                 # finish_reason是"length"，需要继续接续
                 still_needs_continuation = True
             else:
-                # finish_reason不是"length"，但需要检查CSV格式是否完整
+                # finish_reason不是"length"，但需要检查TSV格式是否完整
                 cleaned_text = self._extract_text_from_markdown(combined_text)
                 if cleaned_text:
                     lines = cleaned_text.strip().split('\n')
@@ -563,13 +662,13 @@ class Evaluator:
                         last_line = lines[-1].strip()
                         if last_line:
                             try:
-                                reader = csv.reader([last_line])
+                                reader = csv.reader([last_line], delimiter='\t')
                                 fields = next(reader)
                                 if len(fields) >= 3:
                                     result_value = fields[2].strip().lower() if len(fields) > 2 else ""
                                     if result_value in ["yes", "no", "y", "n", "是", "否"]:
-                                        # CSV格式完整，不需要继续接续
-                                        logger.info(f"接续后CSV格式已完整，停止接续")
+                                        # TSV格式完整，不需要继续接续
+                                        logger.info(f"接续后TSV格式已完整，停止接续")
                                         still_needs_continuation = False
                                     else:
                                         # Result列格式不对，可能还需要接续
@@ -634,9 +733,9 @@ class Evaluator:
         if original_count != len(unique_checkpoints):
             logger.info(f"去重前检查项数量: {original_count}, 去重后: {len(unique_checkpoints)} (已去除 {original_count - len(unique_checkpoints)} 个重复项)")
         
-        # 准备检查项CSV表格
+        # 准备检查项TSV表格
         checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints)
-        logger.debug(f"检查项数量: {len(unique_checkpoints)}, CSV长度: {len(checkpoints_table)} 字符")
+        logger.debug(f"检查项数量: {len(unique_checkpoints)}, TSV长度: {len(checkpoints_table)} 字符")
 
         # 填充模板
         prompt = template.format(
@@ -672,126 +771,183 @@ class Evaluator:
                    f"max_tokens: {api_params.get('max_tokens', 'None')}")
         logger.debug(f"API参数: {json.dumps({k: v for k, v in api_params.items() if k != 'messages'}, ensure_ascii=False)}")
         
-        # 记录请求开始时间
-        start_time = time.time()
+        # 解析重试循环
+        max_parse_retries = self.config.openai.max_parse_retries
+        parse_attempt = 0
+        last_exception = None
         
-        # 调用API（带重试机制）
-        try:
-            response = self._call_api_with_retry(api_params)
-        except ValueError as e:
-            # 重试机制已经记录了详细错误信息
-            logger.debug(f"API调用失败详情:", exc_info=True)
-            raise
-        
-        # 记录响应时间
-        elapsed_time = time.time() - start_time
-        logger.info(f"API调用完成，耗时: {elapsed_time:.2f}秒")
-
-        # 检查响应
-        if not response or not response.choices:
-            logger.error(f"API返回无效响应")
-            logger.debug(f"API返回无效响应详情: {response}")
-            raise ValueError(f"API返回无效响应: {response}")
-
-        # 记录token使用情况
-        if hasattr(response, "usage") and response.usage:
-            usage = response.usage
-            logger.info(f"Token使用 - prompt_tokens: {usage.prompt_tokens}, "
-                       f"completion_tokens: {usage.completion_tokens}, "
-                       f"total_tokens: {usage.total_tokens}")
-
-        # 解析响应
-        result_text = response.choices[0].message.content
-        finish_reason = response.choices[0].finish_reason
-        logger.debug(f"API响应 finish_reason: {finish_reason}")
-        if not result_text:
-            # 尝试获取更多信息
-            error_msg = f"API返回结果为空"
-            logger.error(error_msg)
-            logger.debug(f"API返回结果为空详情。响应对象: {response}")
-            if hasattr(response, "error"):
-                logger.debug(f"错误信息: {response.error}")
-            raise ValueError(error_msg)
-        result_text, _ = self._continue_on_truncation(
-            api_params, result_text, finish_reason, task_name="文档评估"
-        )
-
-        # 记录原始响应
-        logger.debug(f"原始响应长度: {len(result_text)} 字符")
-        # 记录完整原始响应内容
-        logger.debug("=" * 80)
-        logger.debug("完整原始响应内容:")
-        logger.debug("=" * 80)
-        logger.debug(result_text)
-        logger.debug("=" * 80)
-
-        # 清理markdown代码块标记
-        cleaned_text = self._extract_text_from_markdown(result_text)
-        logger.debug(f"清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
-        # 记录完整清理后文本内容
-        logger.debug("=" * 80)
-        logger.debug("完整清理后文本内容:")
-        logger.debug("=" * 80)
-        logger.debug(cleaned_text)
-        logger.debug("=" * 80)
-
-        try:
-            # 解析CSV格式的结果
-            checkpoint_results = self._parse_csv_result(cleaned_text, unique_checkpoints)
+        while parse_attempt <= max_parse_retries:
+            if parse_attempt > 0:
+                logger.warning(
+                    f"解析失败，第 {parse_attempt}/{max_parse_retries} 次重新请求API..."
+                )
+                # 指数退避：延迟时间 = 初始延迟 * 2^(attempt-1)
+                retry_delay = self.config.openai.retry_delay * (2 ** (parse_attempt - 1))
+                time.sleep(retry_delay)
             
-            # 统计通过的检查项数量
-            total_passed = sum(1 for cp in checkpoint_results if cp.passed)
-            logger.info(f"成功解析CSV，共 {total_passed} 个通过的检查项（共 {len(unique_checkpoints)} 个检查项）")
-
-            evaluation = DocumentEvaluation(
-                target_document=str(target_document_path),
-                checkpoints=unique_checkpoints,
-                checkpoint_results=checkpoint_results,
+            # 记录请求开始时间
+            start_time = time.time()
+            
+            # 调用API（带重试机制）
+            try:
+                response = self._call_api_with_retry(api_params)
+            except ValueError as e:
+                # 重试机制已经记录了详细错误信息
+                logger.debug(f"API调用失败详情:", exc_info=True)
+                # 如果是最后一次尝试，抛出异常
+                if parse_attempt >= max_parse_retries:
+                    raise
+                # 否则继续重试
+                last_exception = e
+                parse_attempt += 1
+                continue
+            
+            # 记录响应时间
+            elapsed_time = time.time() - start_time
+            logger.info(f"API调用完成，耗时: {elapsed_time:.2f}秒")
+            
+            # 检查响应
+            if not response or not response.choices:
+                logger.error(f"API返回无效响应")
+                logger.debug(f"API返回无效响应详情: {response}")
+                if parse_attempt >= max_parse_retries:
+                    raise ValueError(f"API返回无效响应: {response}")
+                last_exception = ValueError(f"API返回无效响应: {response}")
+                parse_attempt += 1
+                continue
+            
+            # 记录token使用情况
+            if hasattr(response, "usage") and response.usage:
+                usage = response.usage
+                logger.info(f"Token使用 - prompt_tokens: {usage.prompt_tokens}, "
+                           f"completion_tokens: {usage.completion_tokens}, "
+                           f"total_tokens: {usage.total_tokens}")
+            
+            # 解析响应
+            result_text = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
+            logger.debug(f"API响应 finish_reason: {finish_reason}")
+            if not result_text:
+                # 尝试获取更多信息
+                error_msg = f"API返回结果为空"
+                logger.error(error_msg)
+                logger.debug(f"API返回结果为空详情。响应对象: {response}")
+                if hasattr(response, "error"):
+                    logger.debug(f"错误信息: {response.error}")
+                if parse_attempt >= max_parse_retries:
+                    raise ValueError(error_msg)
+                last_exception = ValueError(error_msg)
+                parse_attempt += 1
+                continue
+            
+            result_text, _ = self._continue_on_truncation(
+                api_params, result_text, finish_reason, task_name="文档评估"
             )
-            logger.info(f"评估完成 - 准确性: {evaluation.accuracy:.2f}, "
-                       f"综合: {evaluation.comprehensive:.2f}")
-            return evaluation
-        except (ValueError, csv.Error) as e:
-            # 提供更详细的错误信息
-            error_preview = result_text[:500] if len(result_text) > 500 else result_text
-            cleaned_preview = cleaned_text[:500] if len(cleaned_text) > 500 else cleaned_text
-            logger.error(f"解析评估结果失败: {e}")
-            logger.debug(f"解析评估结果失败详情:", exc_info=True)
-            logger.debug(f"原始响应（前500字符）: {error_preview}")
-            logger.debug(f"清理后文本（前500字符）: {cleaned_preview}")
-            logger.debug(f"原始响应完整长度: {len(result_text)} 字符")
-            logger.debug(f"清理后文本完整长度: {len(cleaned_text)} 字符")
-            # 异常消息只包含简短信息，详细内容已在日志文件中记录
-            raise ValueError(f"解析评估结果失败: {e} (详细内容请查看日志文件)")
+            
+            # 记录原始响应
+            logger.debug(f"原始响应长度: {len(result_text)} 字符")
+            # 记录完整原始响应内容
+            logger.debug("=" * 80)
+            logger.debug("完整原始响应内容:")
+            logger.debug("=" * 80)
+            logger.debug(result_text)
+            logger.debug("=" * 80)
+            
+            # 清理markdown代码块标记
+            cleaned_text = self._extract_text_from_markdown(result_text)
+            logger.debug(f"清理后文本长度: {len(cleaned_text)} 字符 (减少了 {len(result_text) - len(cleaned_text)} 字符)")
+            # 记录完整清理后文本内容
+            logger.debug("=" * 80)
+            logger.debug("完整清理后文本内容:")
+            logger.debug("=" * 80)
+            logger.debug(cleaned_text)
+            logger.debug("=" * 80)
+            
+            # 尝试解析TSV格式的结果
+            try:
+                checkpoint_results = self._parse_tsv_result(cleaned_text, unique_checkpoints)
+                
+                # 验证解析结果是否有效
+                is_valid, error_msg = self._validate_parse_result(
+                    checkpoint_results, len(unique_checkpoints), cleaned_text
+                )
+                if not is_valid:
+                    raise ValueError(f"解析结果无效: {error_msg}")
+                
+                # 统计通过的检查项数量
+                total_passed = sum(1 for cp in checkpoint_results if cp.passed)
+                logger.info(f"成功解析TSV，共 {total_passed} 个通过的检查项（共 {len(unique_checkpoints)} 个检查项）")
+                
+                evaluation = DocumentEvaluation(
+                    target_document=str(target_document_path),
+                    checkpoints=unique_checkpoints,
+                    checkpoint_results=checkpoint_results,
+                )
+                logger.info(f"评估完成 - 准确性: {evaluation.accuracy:.2f}, "
+                           f"综合: {evaluation.comprehensive:.2f}")
+                
+                # 如果之前有重试，记录成功信息
+                if parse_attempt > 0:
+                    logger.info(f"解析重试成功（第 {parse_attempt + 1} 次尝试）")
+                
+                return evaluation
+                
+            except (ValueError, csv.Error) as e:
+                # 提供更详细的错误信息
+                error_preview = result_text[:500] if len(result_text) > 500 else result_text
+                cleaned_preview = cleaned_text[:500] if len(cleaned_text) > 500 else cleaned_text
+                logger.warning(f"解析评估结果失败: {e}")
+                logger.debug(f"解析评估结果失败详情:", exc_info=True)
+                logger.debug(f"原始响应（前500字符）: {error_preview}")
+                logger.debug(f"清理后文本（前500字符）: {cleaned_preview}")
+                logger.debug(f"原始响应完整长度: {len(result_text)} 字符")
+                logger.debug(f"清理后文本完整长度: {len(cleaned_text)} 字符")
+                
+                # 如果已达到最大重试次数，抛出异常
+                if parse_attempt >= max_parse_retries:
+                    raise ValueError(f"解析评估结果失败（已重试 {max_parse_retries} 次）: {e} (详细内容请查看日志文件)")
+                
+                # 否则继续重试
+                last_exception = e
+                parse_attempt += 1
+                continue
+        
+        # 如果所有重试都失败，抛出最后一个异常
+        if last_exception:
+            raise ValueError(f"解析评估结果失败（已重试 {max_parse_retries} 次）: {last_exception} (详细内容请查看日志文件)")
+        else:
+            raise ValueError(f"解析评估结果失败（已重试 {max_parse_retries} 次）")
 
     def evaluate_multiple_runs(
         self,
         checkpoints: list[str],
         target_document_path: str | Path,
         runs: int = 3,
-        merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
+        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
+        baseline_document_path: str | Path | None = None,
     ) -> DocumentEvaluation:
         """
         多次运行评估并合并结果（并行执行）
         
-        每个评委独立评估，各自得到一个准确性分数，然后使用指定策略合并这些分数。
+        支持两种合并策略：
+        1. CHECKPOINT_MAJORITY: 检查项合并 - 每个检查项按多数投票判定，再统计通过项占比
+        2. ACCURACY_AVERAGE: 准确性合并 - 对每个评委的通过项数量进行平均计算
 
         Args:
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             runs: 运行次数（评委数量）
             merge_strategy: 合并策略，可选值：
-                - AVERAGE: 平均值（默认）
-                - MAJORITY: 多数投票
-                - CONSENSUS_67: 2/3一致性
-                - CONSENSUS_75: 3/4一致性
-                - MEDIAN: 中位数
-                - WEIGHTED: 加权投票
-                - CONFIDENCE: 置信区间法
+                - CHECKPOINT_MAJORITY: 检查项合并（默认）
+                - ACCURACY_AVERAGE: 准确性合并
 
         Returns:
             合并后的评估结果
         """
+        # 记录开始时间
+        start_time = time.time()
+        evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         results = []
         
         # 并行执行多次评估
@@ -820,33 +976,57 @@ class Evaluator:
         if not results:
             raise ValueError("没有成功的评估结果")
 
-        # 收集每个评委的准确性、完整性和综合分数
-        accuracy_scores = [r.accuracy for r in results]
-        completeness_scores = [r.completeness for r in results]
-        comprehensive_scores = [r.comprehensive for r in results]
+        # 处理字符串类型的策略
+        if isinstance(merge_strategy, str):
+            try:
+                merge_strategy = MergeStrategy(merge_strategy)
+            except ValueError:
+                merge_strategy = MergeStrategy.ACCURACY_AVERAGE
 
-        # 使用指定策略合并准确性分数
-        merged_accuracy = self._merge_accuracy_by_strategy(accuracy_scores, merge_strategy)
+        # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
+        all_judge_results = [r.checkpoint_results for r in results]
+
+        # 同时计算两种策略的结果
+        # 策略1：检查项合并 - 每个检查项按多数投票判定，再统计通过项占比
+        checkpoint_merge_result = self.merge_evaluation_results_by_checkpoints(
+            results, checkpoints, target_document_path, merge_strategy=MergeStrategy.CHECKPOINT_MAJORITY
+        )
         
-        # 完整性和综合分数使用平均值（或可以使用相同策略）
-        merged_completeness = statistics.mean(completeness_scores)
-        merged_comprehensive = statistics.mean(comprehensive_scores)
-
-        # 使用第一个评委的详细评估结果（checkpoint_results字段）
-        # 这样可以保留检查项的详细评估信息
+        # 策略2：准确性合并 - 对每个评委的通过项数量进行平均计算
+        accuracy_scores = [r.accuracy for r in results]
+        merged_accuracy = statistics.mean(accuracy_scores)
+        merged_completeness = statistics.mean([r.completeness for r in results])
+        merged_comprehensive = statistics.mean([r.comprehensive for r in results])
+        
         first_result = results[0]
-
-        # 创建最终结果对象，手动设置合并后的分数
-        final_result = DocumentEvaluation(
+        accuracy_merge_result = DocumentEvaluation(
             target_document=str(target_document_path),
             checkpoints=checkpoints,
             checkpoint_results=first_result.checkpoint_results,
+            all_judge_results=all_judge_results,
         )
+        accuracy_merge_result.accuracy = merged_accuracy
+        accuracy_merge_result.completeness = merged_completeness
+        accuracy_merge_result.comprehensive = merged_comprehensive
+
+        # 根据指定策略选择返回哪个结果，但保存两种策略的结果
+        if merge_strategy == MergeStrategy.CHECKPOINT_MAJORITY:
+            final_result = checkpoint_merge_result
+        else:
+            final_result = accuracy_merge_result
         
-        # 覆盖计算出的分数，使用合并后的分数
-        final_result.accuracy = merged_accuracy
-        final_result.completeness = merged_completeness
-        final_result.comprehensive = merged_comprehensive
+        # 在最终结果中保存两种策略的结果
+        final_result.checkpoint_merge_result = checkpoint_merge_result
+        final_result.accuracy_merge_result = accuracy_merge_result
+        
+        # 保存评估元信息
+        final_result.model_name = self.config.openai.model
+        if baseline_document_path:
+            final_result.baseline_document = str(baseline_document_path)
+        
+        # 记录评估时间和耗时
+        final_result.evaluation_time = evaluation_time
+        final_result.evaluation_duration = time.time() - start_time
 
         return final_result
 
@@ -855,18 +1035,16 @@ class Evaluator:
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
+        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
     ) -> DocumentEvaluation:
         """
-        对原始评估结果应用合并策略
-        
-        每个评委独立评估，各自得到一个准确性分数，然后使用指定策略合并这些分数。
+        准确性合并策略：对每个评委的通过项数量进行平均计算
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
-            merge_strategy: 合并策略
+            merge_strategy: 合并策略（仅用于兼容性，实际使用平均值）
         
         Returns:
             合并后的评估结果
@@ -884,22 +1062,23 @@ class Evaluator:
         completeness_scores = [r.completeness for r in raw_results]
         comprehensive_scores = [r.comprehensive for r in raw_results]
 
-        # 使用指定策略合并准确性分数
-        merged_accuracy = self._merge_accuracy_by_strategy(accuracy_scores, merge_strategy)
-        
-        # 完整性和综合分数使用平均值（或可以使用相同策略）
+        # 使用平均值合并
+        merged_accuracy = statistics.mean(accuracy_scores)
         merged_completeness = statistics.mean(completeness_scores)
         merged_comprehensive = statistics.mean(comprehensive_scores)
 
         # 使用第一个评委的详细评估结果（checkpoint_results字段）
-        # 这样可以保留检查项的详细评估信息
         first_result = raw_results[0]
+
+        # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
+        all_judge_results = [r.checkpoint_results for r in raw_results]
 
         # 创建最终结果对象，手动设置合并后的分数
         final_result = DocumentEvaluation(
             target_document=str(target_document_path),
             checkpoints=checkpoints,
             checkpoint_results=first_result.checkpoint_results,
+            all_judge_results=all_judge_results,
         )
         
         # 覆盖计算出的分数，使用合并后的分数
@@ -914,18 +1093,16 @@ class Evaluator:
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.AVERAGE,
+        merge_strategy: MergeStrategy | str = MergeStrategy.CHECKPOINT_MAJORITY,
     ) -> DocumentEvaluation:
         """
-        对原始评估结果应用检查项合并策略
-        
-        合并每个检查项的投票结果，然后重新计算准确性分数。
+        检查项合并策略：每个检查项按多数投票判定结果是否通过，再统计所有投票通过的项占比
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
-            merge_strategy: 合并策略
+            merge_strategy: 合并策略（仅用于兼容性，实际使用多数投票）
         
         Returns:
             合并后的评估结果
@@ -938,37 +1115,34 @@ class Evaluator:
         if runs == 1:
             return raw_results[0]
 
-        # 合并评估结果（基于检查项结果）
-        checkpoint_votes = {}  # checkpoint_index -> {passed_count, total_count, pass_rates}
+        # 合并评估结果（基于检查项结果）- 使用多数投票
+        checkpoint_votes = {}  # checkpoint_index -> {passed_count, total_count}
         for result in raw_results:
             for index, cp_result in enumerate(result.checkpoint_results):
                 if index not in checkpoint_votes:
                     checkpoint_votes[index] = {
                         "passed_count": 0,
                         "total_count": 0,
-                        "pass_rates": [],  # 保存每个评委的 pass_rate
                     }
                 checkpoint_votes[index]["total_count"] += 1
                 if cp_result.passed:
                     checkpoint_votes[index]["passed_count"] += 1
-                # 保存每个评委的 pass_rate（用于中位数计算）
-                checkpoint_votes[index]["pass_rates"].append(
-                    cp_result.pass_rate
-                )
         
-        # 创建合并后的检查项结果
+        # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
+        all_judge_results = [r.checkpoint_results for r in raw_results]
+        
+        # 创建合并后的检查项结果 - 使用多数投票（超过50%认为通过则通过）
         merged_checkpoint_results = []
         for index, checkpoint in enumerate(checkpoints):
             votes = checkpoint_votes.get(index, {
                 "passed_count": 0,
                 "total_count": runs,
-                "pass_rates": [0.0] * runs,
             })
             
-            # 合并检查项结果：根据策略选择不同算法
-            pass_rate, passed = self._merge_checkpoint_by_strategy(
-                votes, runs, True, merge_strategy
-            )
+            # 多数投票：超过50%认为通过则通过
+            passed = votes["passed_count"] > (runs / 2)
+            pass_rate = votes["passed_count"] / runs if runs > 0 else 0.0
+            
             merged_checkpoint_results.append(
                 CheckpointResult(checkpoint=checkpoint, passed=passed, pass_rate=pass_rate)
             )
@@ -979,6 +1153,7 @@ class Evaluator:
             target_document=str(target_document_path),
             checkpoints=checkpoints,
             checkpoint_results=merged_checkpoint_results,
+            all_judge_results=all_judge_results,
         )
         
         return final_result
