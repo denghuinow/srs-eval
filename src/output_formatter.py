@@ -285,3 +285,167 @@ class OutputFormatter:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
+    @staticmethod
+    def generate_summary_report(
+        evaluations: list[DocumentEvaluation],
+        baseline_document: str | Path | None = None,
+    ) -> str:
+        """
+        生成聚合统计报告
+
+        Args:
+            evaluations: 评估结果列表
+            baseline_document: 基准文档路径（可选）
+
+        Returns:
+            Markdown格式的聚合统计报告
+        """
+        if not evaluations:
+            return "# 聚合统计报告\n\n没有评估结果。\n"
+
+        lines = []
+        lines.append("# 批量评估聚合统计报告\n")
+        lines.append("")
+
+        # 评估信息
+        lines.append("## 评估信息\n")
+        lines.append("| 项目 | 内容 |")
+        lines.append("|------|------|")
+        if baseline_document:
+            baseline_name = Path(baseline_document).name
+            lines.append(f"| 基准文档 | {baseline_name} |")
+        lines.append(f"| 评估文档总数 | {len(evaluations)} |")
+        if evaluations and evaluations[0].model_name:
+            lines.append(f"| 评估模型 | {evaluations[0].model_name} |")
+        if evaluations and evaluations[0].evaluation_time:
+            lines.append(f"| 评估时间 | {evaluations[0].evaluation_time} |")
+        lines.append("")
+        lines.append("")
+
+        # 统计信息
+        completeness_scores = [e.completeness for e in evaluations]
+        accuracy_scores = [e.accuracy for e in evaluations]
+        comprehensive_scores = [e.comprehensive for e in evaluations]
+
+        lines.append("## 统计摘要\n")
+        lines.append("")
+
+        # 完整性统计
+        lines.append("### 完整性分数统计\n")
+        lines.append("| 统计项 | 数值 |")
+        lines.append("|:-------|:----:|")
+        lines.append(f"| 平均值 | {statistics.mean(completeness_scores):.2f} |")
+        lines.append(f"| 中位数 | {statistics.median(completeness_scores):.2f} |")
+        lines.append(f"| 最大值 | {max(completeness_scores):.2f} |")
+        lines.append(f"| 最小值 | {min(completeness_scores):.2f} |")
+        if len(completeness_scores) > 1:
+            lines.append(f"| 标准差 | {statistics.stdev(completeness_scores):.2f} |")
+        lines.append("")
+        lines.append("")
+
+        # 准确性统计
+        lines.append("### 准确性分数统计\n")
+        lines.append("| 统计项 | 数值 |")
+        lines.append("|:-------|:----:|")
+        lines.append(f"| 平均值 | {statistics.mean(accuracy_scores):.2f} |")
+        lines.append(f"| 中位数 | {statistics.median(accuracy_scores):.2f} |")
+        lines.append(f"| 最大值 | {max(accuracy_scores):.2f} |")
+        lines.append(f"| 最小值 | {min(accuracy_scores):.2f} |")
+        if len(accuracy_scores) > 1:
+            lines.append(f"| 标准差 | {statistics.stdev(accuracy_scores):.2f} |")
+        lines.append("")
+        lines.append("")
+
+        # 综合分数统计
+        lines.append("### 综合分数统计\n")
+        lines.append("| 统计项 | 数值 |")
+        lines.append("|:-------|:----:|")
+        lines.append(f"| 平均值 | {statistics.mean(comprehensive_scores):.2f} |")
+        lines.append(f"| 中位数 | {statistics.median(comprehensive_scores):.2f} |")
+        lines.append(f"| 最大值 | {max(comprehensive_scores):.2f} |")
+        lines.append(f"| 最小值 | {min(comprehensive_scores):.2f} |")
+        if len(comprehensive_scores) > 1:
+            lines.append(f"| 标准差 | {statistics.stdev(comprehensive_scores):.2f} |")
+        lines.append("")
+        lines.append("")
+
+        # 详细列表
+        lines.append("## 详细评估结果\n")
+        lines.append("")
+        lines.append("| 文档名 | 完整性 | 准确性 | 综合分数 |")
+        lines.append("|:-------|:------:|:------:|:--------:|")
+        
+        # 按综合分数排序（降序）
+        sorted_evaluations = sorted(evaluations, key=lambda e: e.comprehensive, reverse=True)
+        for evaluation in sorted_evaluations:
+            doc_name = Path(evaluation.target_document).name
+            lines.append(
+                f"| {doc_name} | {evaluation.completeness:.2f} | "
+                f"{evaluation.accuracy:.2f} | {evaluation.comprehensive:.2f} |"
+            )
+        lines.append("")
+        lines.append("")
+
+        # 分数分布
+        lines.append("## 分数分布\n")
+        lines.append("")
+
+        # 完整性分布
+        lines.append("### 完整性分数分布\n")
+        score_ranges = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+        lines.append("| 分数区间 | 文档数量 | 占比 |")
+        lines.append("|:---------|:--------:|:----:|")
+        for low, high in score_ranges:
+            count = sum(1 for s in completeness_scores if low <= s < high)
+            if high == 100:
+                count = sum(1 for s in completeness_scores if low <= s <= high)
+            percentage = (count / len(completeness_scores)) * 100 if completeness_scores else 0
+            lines.append(f"| {low}-{high} | {count} | {percentage:.1f}% |")
+        lines.append("")
+        lines.append("")
+
+        # 准确性分布
+        lines.append("### 准确性分数分布\n")
+        lines.append("| 分数区间 | 文档数量 | 占比 |")
+        lines.append("|:---------|:--------:|:----:|")
+        for low, high in score_ranges:
+            count = sum(1 for s in accuracy_scores if low <= s < high)
+            if high == 100:
+                count = sum(1 for s in accuracy_scores if low <= s <= high)
+            percentage = (count / len(accuracy_scores)) * 100 if accuracy_scores else 0
+            lines.append(f"| {low}-{high} | {count} | {percentage:.1f}% |")
+        lines.append("")
+        lines.append("")
+
+        # 综合分数分布
+        lines.append("### 综合分数分布\n")
+        lines.append("| 分数区间 | 文档数量 | 占比 |")
+        lines.append("|:---------|:--------:|:----:|")
+        for low, high in score_ranges:
+            count = sum(1 for s in comprehensive_scores if low <= s < high)
+            if high == 100:
+                count = sum(1 for s in comprehensive_scores if low <= s <= high)
+            percentage = (count / len(comprehensive_scores)) * 100 if comprehensive_scores else 0
+            lines.append(f"| {low}-{high} | {count} | {percentage:.1f}% |")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def save_summary_report(
+        evaluations: list[DocumentEvaluation],
+        output_path: str | Path,
+        baseline_document: str | Path | None = None,
+    ) -> None:
+        """
+        保存聚合统计报告
+
+        Args:
+            evaluations: 评估结果列表
+            output_path: 输出路径
+            baseline_document: 基准文档路径（可选）
+        """
+        content = OutputFormatter.generate_summary_report(evaluations, baseline_document)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+

@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -128,8 +129,12 @@ def main():
     parser.add_argument(
         "--baseline",
         type=str,
-        required=True,
-        help="基准文档路径（作为真值）",
+        help="基准文档路径（作为真值，单个文件）",
+    )
+    parser.add_argument(
+        "--baseline-dir",
+        type=str,
+        help="基准文档文件夹路径（作为真值，文件夹中的第一个 .md 文件）",
     )
     parser.add_argument(
         "--target",
@@ -141,6 +146,11 @@ def main():
         type=str,
         nargs="+",
         help="待评估文档路径（多个文档）",
+    )
+    parser.add_argument(
+        "--target-dir",
+        type=str,
+        help="待评估文档文件夹路径（批量评估文件夹中的所有 .md 文件）",
     )
     parser.add_argument(
         "--judges",
@@ -182,8 +192,11 @@ def main():
     args = parser.parse_args()
 
     # 验证参数
-    if not args.target and not args.targets:
-        parser.error("必须指定 --target 或 --targets")
+    if not args.baseline and not args.baseline_dir:
+        parser.error("必须指定 --baseline 或 --baseline-dir")
+    
+    if not args.target and not args.targets and not args.target_dir:
+        parser.error("必须指定 --target、--targets 或 --target-dir")
 
     # 加载配置
     try:
@@ -195,11 +208,31 @@ def main():
     # 确定评委数量
     judges = args.judges if args.judges is not None else config.eval.default_runs
 
-    # 验证基准文档
-    baseline_path = Path(args.baseline)
-    if not baseline_path.exists():
-        logger.error(f"基准文档不存在: {args.baseline}")
-        sys.exit(1)
+    # 确定基准文档
+    baseline_path = None
+    if args.baseline:
+        baseline_path = Path(args.baseline)
+        if not baseline_path.exists():
+            logger.error(f"基准文档不存在: {args.baseline}")
+            sys.exit(1)
+        if not baseline_path.is_file():
+            logger.error(f"基准文档路径不是文件: {args.baseline}")
+            sys.exit(1)
+    elif args.baseline_dir:
+        baseline_dir = Path(args.baseline_dir)
+        if not baseline_dir.exists():
+            logger.error(f"基准文档文件夹不存在: {args.baseline_dir}")
+            sys.exit(1)
+        if not baseline_dir.is_dir():
+            logger.error(f"基准文档路径不是文件夹: {args.baseline_dir}")
+            sys.exit(1)
+        # 扫描文件夹中的第一个 .md 文件
+        md_files = sorted(baseline_dir.glob("*.md")) + sorted(baseline_dir.glob("*.markdown"))
+        if not md_files:
+            logger.error(f"基准文档文件夹中没有找到 .md 文件: {args.baseline_dir}")
+            sys.exit(1)
+        baseline_path = md_files[0]
+        logger.info(f"从基准文档文件夹中选择: {baseline_path.name}")
 
     # 确定待评估文档列表
     target_paths = []
@@ -207,11 +240,29 @@ def main():
         target_paths.append(Path(args.target))
     if args.targets:
         target_paths.extend([Path(t) for t in args.targets])
+    if args.target_dir:
+        target_dir = Path(args.target_dir)
+        if not target_dir.exists():
+            logger.error(f"待评估文档文件夹不存在: {args.target_dir}")
+            sys.exit(1)
+        if not target_dir.is_dir():
+            logger.error(f"待评估文档路径不是文件夹: {args.target_dir}")
+            sys.exit(1)
+        # 扫描文件夹中的所有 .md 文件（递归）
+        md_files = sorted(target_dir.rglob("*.md")) + sorted(target_dir.rglob("*.markdown"))
+        if not md_files:
+            logger.error(f"待评估文档文件夹中没有找到 .md 文件: {args.target_dir}")
+            sys.exit(1)
+        target_paths.extend(md_files)
+        logger.info(f"从待评估文档文件夹中找到 {len(md_files)} 个文档")
 
     # 验证待评估文档
     for target_path in target_paths:
         if not target_path.exists():
             logger.error(f"待评估文档不存在: {target_path}")
+            sys.exit(1)
+        if not target_path.is_file():
+            logger.error(f"待评估文档路径不是文件: {target_path}")
             sys.exit(1)
 
     logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
@@ -388,6 +439,14 @@ def main():
         formatter.to_csv(evaluations, csv_path)
         logger.info(f"✓ CSV: {csv_path}")
 
+    # 如果有多个评估结果，生成聚合统计报告
+    if len(evaluations) > 1:
+        logger.info("")
+        logger.info("正在生成聚合统计报告...")
+        summary_path = output_dir / "summary_report.md"
+        formatter.save_summary_report(evaluations, summary_path, baseline_path)
+        logger.info(f"✓ 聚合统计报告: {summary_path}")
+
     logger.info("")
     logger.info("评估完成！")
 
@@ -401,6 +460,30 @@ def main():
             f"完整性={evaluation.completeness:.2f}, "
             f"准确性={evaluation.accuracy:.2f}, "
             f"综合={evaluation.comprehensive:.2f}"
+        )
+    
+    # 如果有多个评估结果，打印聚合统计
+    if len(evaluations) > 1:
+        logger.info("")
+        logger.info("聚合统计:")
+        logger.info("-" * 60)
+        completeness_scores = [e.completeness for e in evaluations]
+        accuracy_scores = [e.accuracy for e in evaluations]
+        comprehensive_scores = [e.comprehensive for e in evaluations]
+        logger.info(
+            f"完整性 - 平均: {statistics.mean(completeness_scores):.2f}, "
+            f"中位数: {statistics.median(completeness_scores):.2f}, "
+            f"范围: [{min(completeness_scores):.2f}, {max(completeness_scores):.2f}]"
+        )
+        logger.info(
+            f"准确性 - 平均: {statistics.mean(accuracy_scores):.2f}, "
+            f"中位数: {statistics.median(accuracy_scores):.2f}, "
+            f"范围: [{min(accuracy_scores):.2f}, {max(accuracy_scores):.2f}]"
+        )
+        logger.info(
+            f"综合 - 平均: {statistics.mean(comprehensive_scores):.2f}, "
+            f"中位数: {statistics.median(comprehensive_scores):.2f}, "
+            f"范围: [{min(comprehensive_scores):.2f}, {max(comprehensive_scores):.2f}]"
         )
 
 
