@@ -36,12 +36,8 @@ ENV/
 .env
 
 # 输出文件
-output/
-*.json
-*.csv
-*.md
-!README.md
-
+!output/示例报告.md
+output
 # 缓存文件
 .cache/
 
