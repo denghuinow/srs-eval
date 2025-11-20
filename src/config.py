@@ -43,6 +43,17 @@ class Config(BaseModel):
 
     openai: OpenAIConfig
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    
+    @classmethod
+    def get_max_context_length(cls) -> Optional[int]:
+        """获取最大上下文长度配置值"""
+        max_context_length_str = os.getenv("MAX_CONTEXT_LENGTH")
+        if max_context_length_str:
+            try:
+                return int(max_context_length_str)
+            except ValueError:
+                return None
+        return None
 
 
 def load_config() -> Config:

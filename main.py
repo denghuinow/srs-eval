@@ -217,6 +217,11 @@ def main():
         default=None,
         help="并行执行的最大工作线程数（默认：自动，根据任务数量调整）",
     )
+    parser.add_argument(
+        "--extract-cache-only",
+        action="store_true",
+        help="仅构建要点缓存，不进行评估",
+    )
 
     args = parser.parse_args()
 
@@ -224,8 +229,10 @@ def main():
     if not args.baseline and not args.baseline_dir:
         parser.error("必须指定 --baseline 或 --baseline-dir")
     
-    if not args.target and not args.targets and not args.target_dir:
-        parser.error("必须指定 --target、--targets 或 --target-dir")
+    # 如果使用 --extract-cache-only，可以不指定 target
+    if not args.extract_cache_only:
+        if not args.target and not args.targets and not args.target_dir:
+            parser.error("必须指定 --target、--targets 或 --target-dir")
 
     # 加载配置
     try:
@@ -265,14 +272,154 @@ def main():
         if args.target_dir:
             use_matching_mode = True
             logger.info(f"使用匹配模式：将为每个目标文档匹配对应的基准文档")
-        else:
-            # 如果没有指定目标文档目录，则使用第一个 .md 文件作为基准文档
+        elif not args.extract_cache_only:
+            # 如果没有指定目标文档目录，且不是仅构建缓存模式，则使用第一个 .md 文件作为基准文档
             md_files = sorted(baseline_dir.glob("*.md")) + sorted(baseline_dir.glob("*.markdown"))
             if not md_files:
                 logger.error(f"基准文档文件夹中没有找到 .md 文件: {args.baseline_dir}")
                 sys.exit(1)
             baseline_path = md_files[0]
             logger.info(f"从基准文档文件夹中选择: {baseline_path.name}")
+
+    # 如果使用 --extract-cache-only，仅构建要点缓存，不进行评估
+    if args.extract_cache_only:
+        logger.info("=" * 60)
+        logger.info("仅构建要点缓存模式（不进行评估）")
+        logger.info("=" * 60)
+        logger.info("")
+        
+        extractor = PointExtractor(config)
+        logger.info(f"使用模型: {config.openai.model}")
+        logger.info(f"API地址: {config.openai.base_url}")
+        
+        if args.force_extract:
+            logger.info("⚠ 强制重新提取模式（忽略缓存）")
+        else:
+            logger.info("ℹ 使用缓存机制（如果存在）")
+        
+        if args.extract_runs > 1:
+            logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择检查项数量最多的结果")
+        logger.info("")
+        
+        # 确定要提取的基准文档列表
+        baseline_docs = []
+        if baseline_dir:
+            # 如果指定了基准目录，提取目录中的所有 .md 文件（递归）
+            md_files = sorted(baseline_dir.rglob("*.md")) + sorted(baseline_dir.rglob("*.markdown"))
+            if not md_files:
+                logger.error(f"基准文档文件夹中没有找到 .md 文件: {args.baseline_dir}")
+                sys.exit(1)
+            baseline_docs.extend(md_files)
+            logger.info(f"找到 {len(baseline_docs)} 个基准文档")
+        elif baseline_path:
+            # 如果只指定了单个基准文档，只处理该文档
+            baseline_docs.append(baseline_path)
+        
+        # 检查缓存并过滤需要处理的文档
+        from src.document_parser import DocumentParser
+        parser = DocumentParser()
+        docs_to_process = []
+        skipped_count = 0
+        
+        if not args.force_extract:
+            logger.info("检查缓存状态...")
+            for doc_path in baseline_docs:
+                try:
+                    # 读取文档内容以计算hash
+                    content = parser.read_markdown(doc_path)
+                    content_hash = extractor._get_content_hash(content)
+                    
+                    # 检查缓存是否存在
+                    if extractor.has_cache(doc_path, content_hash):
+                        logger.info(f"⊘ {doc_path.name} - 缓存已存在，跳过")
+                        skipped_count += 1
+                    else:
+                        docs_to_process.append(doc_path)
+                except Exception as e:
+                    logger.warning(f"⚠ {doc_path.name} - 检查缓存时出错: {e}，将尝试提取")
+                    docs_to_process.append(doc_path)
+        else:
+            docs_to_process = baseline_docs
+        
+        if skipped_count > 0:
+            logger.info(f"已跳过 {skipped_count} 个已有缓存的文档")
+        if docs_to_process:
+            logger.info(f"需要处理 {len(docs_to_process)} 个文档")
+        logger.info("")
+        
+        if not docs_to_process:
+            logger.info("=" * 60)
+            logger.info("所有文档的缓存已存在，无需处理！")
+            logger.info("=" * 60)
+            sys.exit(0)
+        
+        # 确定是否并行执行
+        parallel_extract = len(docs_to_process) > 1
+        max_workers = args.max_workers
+        
+        if parallel_extract:
+            if max_workers is None:
+                max_workers = min(len(docs_to_process), 10)  # 最多10个并行
+            logger.info(f"ℹ 并行执行模式：最大工作线程数 = {max_workers}")
+            logger.info("")
+        
+        # 提取要点缓存的函数
+        def extract_document(doc_path: Path) -> tuple[Path, bool, int | None]:
+            """提取单个文档的要点缓存"""
+            try:
+                checkpoints = extractor.extract_points(
+                    doc_path,
+                    force_extract=args.force_extract,
+                    extract_runs=args.extract_runs,
+                )
+                return (doc_path, True, len(checkpoints))
+            except Exception as e:
+                logger.error(f"✗ {doc_path.name} - 提取要点失败: {e}")
+                logger.debug(f"提取要点失败详情:", exc_info=True)
+                return (doc_path, False, None)
+        
+        # 提取要点缓存
+        success_count = 0
+        if parallel_extract:
+            # 并行执行
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(extract_document, doc_path): doc_path
+                    for doc_path in docs_to_process
+                }
+                
+                completed = 0
+                for future in as_completed(futures):
+                    completed += 1
+                    doc_path, success, checkpoint_count = future.result()
+                    if success:
+                        success_count += 1
+                        logger.info(
+                            f"[{completed}/{len(docs_to_process)}] ✓ {doc_path.name} - "
+                            f"检查项清单：共 {checkpoint_count} 个检查项"
+                        )
+                    else:
+                        logger.info(f"[{completed}/{len(docs_to_process)}] ✗ {doc_path.name} - 提取失败")
+        else:
+            # 串行执行
+            for doc_path in docs_to_process:
+                logger.info(f"正在从基准文档提取要点清单: {doc_path.name}")
+                logger.info("-" * 60)
+                
+                doc_path, success, checkpoint_count = extract_document(doc_path)
+                if success:
+                    success_count += 1
+                    logger.info(f"✓ {doc_path.name} - 检查项清单：共 {checkpoint_count} 个检查项")
+                logger.info("")
+        
+        logger.info("=" * 60)
+        logger.info(f"要点缓存构建完成！")
+        logger.info(f"  成功: {success_count}/{len(docs_to_process)}")
+        if skipped_count > 0:
+            logger.info(f"  跳过: {skipped_count} (已有缓存)")
+        logger.info(f"  总计: {len(baseline_docs)}")
+        logger.info("=" * 60)
+        sys.exit(0)
 
     # 确定待评估文档列表
     target_paths = []

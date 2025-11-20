@@ -13,6 +13,7 @@ from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
+from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -160,47 +161,81 @@ class PointExtractor:
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
+    def has_cache(self, document_path: str | Path, content_hash: str | None = None) -> bool:
+        """
+        检查缓存是否存在且有效（不加载内容，只检查）
+        通过遍历所有缓存文件，使用content_hash匹配
+
+        Args:
+            document_path: 文档路径
+            content_hash: 文档内容hash（用于验证缓存有效性，必须提供）
+
+        Returns:
+            如果缓存存在且有效则返回True，否则返回False
+        """
+        if content_hash is None:
+            return False
+        
+        cache_dir = Path(__file__).parent.parent / ".cache" / "points"
+        if not cache_dir.exists():
+            return False
+        
+        # 遍历所有缓存文件，通过content_hash匹配
+        for cache_file in cache_dir.glob("*.json"):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                
+                # 验证content_hash是否匹配
+                cached_hash = cache_data.get("content_hash", "")
+                if cached_hash == content_hash:
+                    # 检查checkpoints数组是否存在且非空
+                    checkpoints = cache_data.get("checkpoints", [])
+                    if checkpoints:
+                        return True
+            except (json.JSONDecodeError, KeyError, IOError):
+                continue
+        
+        return False
+
     def _load_points_cache(
         self, document_path: str | Path, content_hash: str | None = None
     ) -> list[str] | None:
         """
         从缓存文件加载检查项清单
+        通过遍历所有缓存文件，使用content_hash匹配
 
         Args:
-            document_path: 文档路径
-            content_hash: 文档内容hash（用于验证缓存有效性，如果为None则不验证）
+            document_path: 文档路径（用于日志记录，实际匹配使用content_hash）
+            content_hash: 文档内容hash（用于验证缓存有效性，必须提供）
 
         Returns:
             检查项清单，如果缓存不存在或无效则返回None
         """
-        cache_path = self._get_cache_path(document_path)
+        if content_hash is None:
+            return None
         
-        if not cache_path.exists():
+        cache_dir = Path(__file__).parent.parent / ".cache" / "points"
+        if not cache_dir.exists():
             return None
-
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cache_data = json.load(f)
-            
-            # 验证文档路径是否匹配
-            cached_path = cache_data.get("document_path", "")
-            if cached_path != str(Path(document_path).absolute()):
-                return None
-            
-            # 如果提供了content_hash，验证缓存是否有效
-            if content_hash is not None:
+        
+        # 遍历所有缓存文件，通过content_hash匹配
+        for cache_file in cache_dir.glob("*.json"):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                
+                # 验证content_hash是否匹配
                 cached_hash = cache_data.get("content_hash", "")
-                if cached_hash != content_hash:
-                    return None
-            
-            # 读取checkpoints数组
-            checkpoints = cache_data.get("checkpoints", [])
-            if not checkpoints:
-                return None
-            
-            return checkpoints
-        except (json.JSONDecodeError, KeyError, IOError):
-            return None
+                if cached_hash == content_hash:
+                    # 读取checkpoints数组
+                    checkpoints = cache_data.get("checkpoints", [])
+                    if checkpoints:
+                        return checkpoints
+            except (json.JSONDecodeError, KeyError, IOError):
+                continue
+        
+        return None
 
     def _call_api_with_retry(self, api_params: dict[str, Any]) -> Any:
         """
@@ -497,6 +532,32 @@ class PointExtractor:
         # 只有当 max_tokens 配置了值时才添加到参数中
         if self.config.openai.max_tokens is not None:
             api_params["max_tokens"] = self.config.openai.max_tokens
+        
+        # 在请求前计算输入 token 并调整 MAX_TOKENS
+        max_context_length = Config.get_max_context_length()
+        if max_context_length is not None:
+            adjusted_max_tokens = calculate_adjusted_max_tokens(
+                messages=api_params["messages"],
+                max_context_length=max_context_length,
+                configured_max_tokens=api_params.get("max_tokens")
+            )
+            
+            if adjusted_max_tokens is not None:
+                api_params["max_tokens"] = adjusted_max_tokens
+                # 记录 token 计算信息
+                input_tokens = count_tokens(api_params["messages"])
+                if input_tokens is not None:
+                    logger.debug(
+                        f"{log_prefix}Token计算 - 输入: {input_tokens}, "
+                        f"最大上下文: {max_context_length}, "
+                        f"调整后MAX_TOKENS: {adjusted_max_tokens}"
+                    )
+            elif "max_tokens" in api_params:
+                # 如果调整后为 None（输入已超过最大上下文长度），移除 max_tokens 参数
+                del api_params["max_tokens"]
+                logger.warning(
+                    f"{log_prefix}输入token数量可能超过最大上下文长度，移除MAX_TOKENS限制"
+                )
         
         # 添加 stream 参数
         api_params["stream"] = self.config.openai.stream

@@ -17,6 +17,7 @@ from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
+from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -147,7 +148,9 @@ class Evaluator:
                 text = text[:last_code_block]
         
         # 清理后的文本可能包含代码块前的说明文字
-        # 查找TSV表头（Index\tReason\tResult 或 索引编号\t判定理由\t判定结果）
+        # 查找TSV表头（支持两种格式：
+        # 1. Index\tPass（新格式，两列）
+        # 2. Index\tReason\tResult 或 索引编号\t判定理由\t判定结果（旧格式，三列））
         # 只保留从表头开始的内容
         lines = text.split('\n')
         header_found = False
@@ -156,8 +159,14 @@ class Evaluator:
         # 查找表头行
         for i, line in enumerate(lines):
             line_lower = line.strip().lower()
-            # 检查是否是TSV表头
+            # 检查是否是TSV表头（新格式：Index\tPass）
             if (line_lower.startswith('index') and '\t' in line and 
+                'pass' in line_lower and line_lower.count('\t') == 1):
+                header_found = True
+                header_index = i
+                break
+            # 检查是否是TSV表头（旧格式：Index\tReason\tResult）
+            elif (line_lower.startswith('index') and '\t' in line and 
                 ('reason' in line_lower or 'result' in line_lower)):
                 header_found = True
                 header_index = i
@@ -285,11 +294,17 @@ class Evaluator:
                     logger.debug(f"跳过非数据行（索引列不是数字）: {row}")
                     continue
                 
-                result_str_raw = row.get("Result", row.get("判定结果", ""))
+                # 优先尝试从 Pass 列读取（新格式：Index, Pass）
+                result_str_raw = row.get("Pass", "")
                 result_str = (result_str_raw or "").strip().lower()
                 
-                # 如果判定结果列为空，尝试从判定理由列末尾提取
-                if not result_str or result_str in ["Reason", "判定理由"]:
+                # 如果没有 Pass 列，尝试从 Result 列读取（兼容旧格式：Index, Reason, Result）
+                if not result_str or result_str in ["Pass", "pass"]:
+                    result_str_raw = row.get("Result", row.get("判定结果", ""))
+                    result_str = (result_str_raw or "").strip().lower()
+                
+                # 如果判定结果列为空，尝试从判定理由列末尾提取（兼容旧格式）
+                if not result_str or result_str in ["Reason", "判定理由", "Pass", "pass"]:
                     reason_str = row.get("Reason", row.get("判定理由", ""))
                     if reason_str:
                         # 尝试从判定理由末尾提取 yes/no
@@ -305,12 +320,12 @@ class Evaluator:
                             result_str = "no"
                     
                     # 如果仍然没有找到，记录警告
-                    if not result_str or result_str in ["Reason", "判定理由"]:
+                    if not result_str or result_str in ["Reason", "判定理由", "Pass", "pass"]:
                         missing_result_count += 1
                         if missing_result_count <= 3:  # 只记录前3个，避免日志过多
                             logger.warning(
                                 f"检查项 {index} 的判定结果列缺失或格式错误: "
-                                f"期望 'yes' 或 'no'，实际得到 '{row.get('Result', row.get('判定结果', ''))}'。"
+                                f"期望 'yes' 或 'no'，实际得到 '{row.get('Pass', row.get('Result', row.get('判定结果', '')))}'。"
                                 f"整行内容: {row}"
                             )
                         # 如果判定结果列缺失或格式错误，默认判定为未通过
@@ -334,7 +349,7 @@ class Evaluator:
             logger.warning(
                 f"警告: 发现 {missing_result_count} 个检查项的判定结果列缺失或格式错误。"
                 f"这些检查项将被默认判定为未通过。"
-                f"请检查API返回的TSV格式是否正确，应包含三列：Index	Reason	Result (或 索引编号	判定理由	判定结果，使用制表符分隔)"
+                f"请检查API返回的TSV格式是否正确，应包含两列：Index	Pass (或三列：Index	Reason	Result，使用制表符分隔)"
             )
 
         # 构建检查项结果列表
@@ -515,12 +530,26 @@ class Evaluator:
             truncation_reason = "finish_reason为'length'"
         else:
             # 检测TSV格式是否被截断：检查最后一行是否完整
-            # TSV格式应该是：Index	Reason	Result 或 索引编号	判定理由	判定结果（使用制表符分隔）
-            # 完整行应该有3列，且最后一行应该以yes或no结尾
+            # 支持两种格式：
+            # 1. Index	Pass（新格式，2列）
+            # 2. Index	Reason	Result 或 索引编号	判定理由	判定结果（旧格式，3列）
             cleaned_text = self._extract_text_from_markdown(accumulated_text)
             if cleaned_text:
                 lines = cleaned_text.strip().split('\n')
                 if len(lines) > 1:  # 至少有表头和数据行
+                    # 检测表头格式，确定期望的列数
+                    header_line = lines[0].strip().lower()
+                    expected_columns = 3  # 默认期望3列（旧格式）
+                    pass_column_index = 1  # Pass列在第二列（索引1）
+                    result_column_index = 2  # Result列在第三列（索引2）
+                    
+                    # 检查是否是两列格式（Index\tPass）
+                    if header_line.startswith('index') and '\t' in header_line:
+                        header_fields = header_line.split('\t')
+                        if len(header_fields) == 2 and 'pass' in header_line:
+                            expected_columns = 2
+                            pass_column_index = 1
+                    
                     # 检查最后一行是否完整
                     last_line = lines[-1].strip()
                     if last_line:
@@ -528,17 +557,24 @@ class Evaluator:
                         try:
                             reader = csv.reader([last_line], delimiter='\t')
                             fields = next(reader)
-                            # 如果最后一行字段数少于3，或者不以yes/no结尾，可能被截断
-                            if len(fields) < 3:
+                            # 如果最后一行字段数少于期望列数，可能被截断
+                            if len(fields) < expected_columns:
                                 needs_continuation = True
-                                truncation_reason = f"最后一行字段数不足（{len(fields)}/3）"
-                            elif len(fields) == 3:
-                                # 检查Result列是否有值
-                                result_value = fields[2].strip().lower() if len(fields) > 2 else ""
-                                if not result_value or result_value not in ["yes", "no", "y", "n", "是", "否"]:
-                                    # 如果Result列为空或格式不对，可能被截断
-                                    needs_continuation = True
-                                    truncation_reason = f"最后一行Result列格式异常: '{result_value}'"
+                                truncation_reason = f"最后一行字段数不足（{len(fields)}/{expected_columns}）"
+                            elif len(fields) >= expected_columns:
+                                # 检查Pass列或Result列是否有值
+                                if expected_columns == 2:
+                                    # 两列格式：检查Pass列
+                                    pass_value = fields[pass_column_index].strip().lower() if len(fields) > pass_column_index else ""
+                                    if not pass_value or pass_value not in ["yes", "no", "y", "n", "是", "否"]:
+                                        needs_continuation = True
+                                        truncation_reason = f"最后一行Pass列格式异常: '{pass_value}'"
+                                else:
+                                    # 三列格式：检查Result列
+                                    result_value = fields[result_column_index].strip().lower() if len(fields) > result_column_index else ""
+                                    if not result_value or result_value not in ["yes", "no", "y", "n", "是", "否"]:
+                                        needs_continuation = True
+                                        truncation_reason = f"最后一行Result列格式异常: '{result_value}'"
                         except Exception:
                             # 解析失败，可能格式有问题，尝试其他检测方法
                             # 检查是否以引号开始但未结束（可能被截断）
@@ -692,25 +728,52 @@ class Evaluator:
                 if cleaned_text:
                     lines = cleaned_text.strip().split('\n')
                     if len(lines) > 1:
+                        # 检测表头格式，确定期望的列数
+                        header_line = lines[0].strip().lower()
+                        expected_columns = 3  # 默认期望3列（旧格式）
+                        pass_column_index = 1  # Pass列在第二列（索引1）
+                        result_column_index = 2  # Result列在第三列（索引2）
+                        
+                        # 检查是否是两列格式（Index\tPass）
+                        if header_line.startswith('index') and '\t' in header_line:
+                            header_fields = header_line.split('\t')
+                            if len(header_fields) == 2 and 'pass' in header_line:
+                                expected_columns = 2
+                                pass_column_index = 1
+                        
                         last_line = lines[-1].strip()
                         if last_line:
                             try:
                                 reader = csv.reader([last_line], delimiter='\t')
                                 fields = next(reader)
-                                if len(fields) >= 3:
-                                    result_value = fields[2].strip().lower() if len(fields) > 2 else ""
-                                    if result_value in ["yes", "no", "y", "n", "是", "否"]:
-                                        # TSV格式完整，不需要继续接续
-                                        logger.info(f"接续后TSV格式已完整，停止接续")
-                                        still_needs_continuation = False
+                                if len(fields) >= expected_columns:
+                                    # 检查Pass列或Result列是否有值
+                                    if expected_columns == 2:
+                                        # 两列格式：检查Pass列
+                                        pass_value = fields[pass_column_index].strip().lower() if len(fields) > pass_column_index else ""
+                                        if pass_value in ["yes", "no", "y", "n", "是", "否"]:
+                                            # TSV格式完整，不需要继续接续
+                                            logger.info(f"接续后TSV格式已完整，停止接续")
+                                            still_needs_continuation = False
+                                        else:
+                                            # Pass列格式不对，可能还需要接续
+                                            still_needs_continuation = True
+                                            logger.debug(f"接续后最后一行Pass列格式仍异常: '{pass_value}'，继续接续")
                                     else:
-                                        # Result列格式不对，可能还需要接续
-                                        still_needs_continuation = True
-                                        logger.debug(f"接续后最后一行Result列格式仍异常: '{result_value}'，继续接续")
+                                        # 三列格式：检查Result列
+                                        result_value = fields[result_column_index].strip().lower() if len(fields) > result_column_index else ""
+                                        if result_value in ["yes", "no", "y", "n", "是", "否"]:
+                                            # TSV格式完整，不需要继续接续
+                                            logger.info(f"接续后TSV格式已完整，停止接续")
+                                            still_needs_continuation = False
+                                        else:
+                                            # Result列格式不对，可能还需要接续
+                                            still_needs_continuation = True
+                                            logger.debug(f"接续后最后一行Result列格式仍异常: '{result_value}'，继续接续")
                                 else:
                                     # 字段数不足，需要继续接续
                                     still_needs_continuation = True
-                                    logger.debug(f"接续后最后一行字段数仍不足（{len(fields)}/3），继续接续")
+                                    logger.debug(f"接续后最后一行字段数仍不足（{len(fields)}/{expected_columns}），继续接续")
                             except Exception as e:
                                 # 解析失败，检查其他截断特征
                                 if last_line.count('"') % 2 != 0 or last_line.endswith(','):
@@ -781,7 +844,7 @@ class Evaluator:
         logger.debug(f"文档内容长度: {len(target_content)} 字符")
 
         # 加载prompt模板
-        template = self._load_prompt_template("evaluate_points.txt")
+        template = self._load_prompt_template("evaluate_points-tsv-think-zh.txt")
 
         # 去除检查项中的重复项（保持顺序）
         original_count = len(checkpoints)
@@ -824,6 +887,32 @@ class Evaluator:
         # 只有当 max_tokens 配置了值时才添加到参数中
         if self.config.openai.max_tokens is not None:
             api_params["max_tokens"] = self.config.openai.max_tokens
+        
+        # 在请求前计算输入 token 并调整 MAX_TOKENS
+        max_context_length = Config.get_max_context_length()
+        if max_context_length is not None:
+            adjusted_max_tokens = calculate_adjusted_max_tokens(
+                messages=api_params["messages"],
+                max_context_length=max_context_length,
+                configured_max_tokens=api_params.get("max_tokens")
+            )
+            
+            if adjusted_max_tokens is not None:
+                api_params["max_tokens"] = adjusted_max_tokens
+                # 记录 token 计算信息
+                input_tokens = count_tokens(api_params["messages"])
+                if input_tokens is not None:
+                    logger.debug(
+                        f"Token计算 - 输入: {input_tokens}, "
+                        f"最大上下文: {max_context_length}, "
+                        f"调整后MAX_TOKENS: {adjusted_max_tokens}"
+                    )
+            elif "max_tokens" in api_params:
+                # 如果调整后为 None（输入已超过最大上下文长度），移除 max_tokens 参数
+                del api_params["max_tokens"]
+                logger.warning(
+                    "输入token数量可能超过最大上下文长度，移除MAX_TOKENS限制"
+                )
         
         # 添加 stream 参数
         api_params["stream"] = self.config.openai.stream
