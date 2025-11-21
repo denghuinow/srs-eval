@@ -43,6 +43,7 @@ class Config(BaseModel):
 
     openai: OpenAIConfig
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    prompt_version: str = Field(default="v1", description="提示词版本")
     
     @classmethod
     def get_max_context_length(cls) -> Optional[int]:
@@ -100,4 +101,6 @@ def load_config() -> Config:
         accuracy_weight=float(os.getenv("ACCURACY_WEIGHT", "0.5")),
     )
 
-    return Config(openai=openai_config, eval=eval_config)
+    prompt_version = os.getenv("PROMPT_VERSION", "v1")
+
+    return Config(openai=openai_config, eval=eval_config, prompt_version=prompt_version)

@@ -22,14 +22,16 @@ logger = logging.getLogger(__name__)
 class PointExtractor:
     """从基准文档提取结构化要点清单"""
 
-    def __init__(self, config: Config | None = None):
+    def __init__(self, config: Config | None = None, prompt_version: str | None = None):
         """
         初始化要点提取器
 
         Args:
             config: 配置对象，如果为None则自动加载
+            prompt_version: 提示词版本，如果为None则使用配置中的版本
         """
         self.config = config or load_config()
+        self.prompt_version = prompt_version or self.config.prompt_version
         self.client = OpenAI(
             api_key=self.config.openai.api_key,
             base_url=self.config.openai.base_url,
@@ -100,11 +102,24 @@ class PointExtractor:
         Returns:
             模板内容
         """
+        # 构建文件路径：prompts/{version}/{template_name}
         template_path = (
-            Path(__file__).parent.parent / "prompts" / template_name
+            Path(__file__).parent.parent / "prompts" / self.prompt_version / template_name
         )
         if not template_path.exists():
-            raise FileNotFoundError(f"模板文件不存在: {template_path}")
+            # 如果指定版本不存在，尝试使用v1作为默认版本
+            if self.prompt_version != "v1":
+                logger.warning(
+                    f"提示词文件不存在: {template_path}，尝试使用 v1 版本"
+                )
+                template_path = (
+                    Path(__file__).parent.parent / "prompts" / "v1" / template_name
+                )
+        
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"模板文件不存在: {template_path}，请检查提示词版本和文件路径"
+            )
         return template_path.read_text(encoding="utf-8")
 
     def _get_cache_path(self, document_path: str | Path) -> Path:
@@ -501,7 +516,7 @@ class PointExtractor:
         log_prefix = f"[{Path(document_path).name}] " if document_path else ""
         
         # 加载prompt模板
-        template = self._load_prompt_template("extract_points.txt")
+        template = self._load_prompt_template("extract_points.md")
         logger.info(f"{log_prefix}开始提取要点")
         logger.debug(f"{log_prefix}文档内容长度: {len(content)} 字符")
 

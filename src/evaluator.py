@@ -95,14 +95,16 @@ class DocumentEvaluation:
 class Evaluator:
     """文档评估器"""
 
-    def __init__(self, config: Config | None = None):
+    def __init__(self, config: Config | None = None, prompt_version: str | None = None):
         """
         初始化评估器
 
         Args:
             config: 配置对象，如果为None则自动加载
+            prompt_version: 提示词版本，如果为None则使用配置中的版本
         """
         self.config = config or load_config()
+        self.prompt_version = prompt_version or self.config.prompt_version
         self.client = OpenAI(
             api_key=self.config.openai.api_key,
             base_url=self.config.openai.base_url,
@@ -372,11 +374,24 @@ class Evaluator:
         Returns:
             模板内容
         """
+        # 构建文件路径：prompts/{version}/{template_name}
         template_path = (
-            Path(__file__).parent.parent / "prompts" / template_name
+            Path(__file__).parent.parent / "prompts" / self.prompt_version / template_name
         )
         if not template_path.exists():
-            raise FileNotFoundError(f"模板文件不存在: {template_path}")
+            # 如果指定版本不存在，尝试使用v1作为默认版本
+            if self.prompt_version != "v1":
+                logger.warning(
+                    f"提示词文件不存在: {template_path}，尝试使用 v1 版本"
+                )
+                template_path = (
+                    Path(__file__).parent.parent / "prompts" / "v1" / template_name
+                )
+        
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"模板文件不存在: {template_path}，请检查提示词版本和文件路径"
+            )
         return template_path.read_text(encoding="utf-8")
 
     def _call_api_with_retry(self, api_params: dict[str, Any]) -> Any:
@@ -844,7 +859,7 @@ class Evaluator:
         logger.debug(f"文档内容长度: {len(target_content)} 字符")
 
         # 加载prompt模板
-        template = self._load_prompt_template("evaluate_points-tsv-think-zh.txt")
+        template = self._load_prompt_template("evaluate_points.md")
 
         # 去除检查项中的重复项（保持顺序）
         original_count = len(checkpoints)
@@ -1563,3 +1578,4 @@ class Evaluator:
             # 默认使用平均值
             passed = pass_ratio >= 0.5
             return pass_ratio, passed
+

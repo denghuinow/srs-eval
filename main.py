@@ -222,6 +222,12 @@ def main():
         action="store_true",
         help="仅构建要点缓存，不进行评估",
     )
+    parser.add_argument(
+        "--prompt-version",
+        type=str,
+        default=None,
+        help="提示词版本（默认：从环境变量PROMPT_VERSION或配置中读取，默认值为v1）",
+    )
 
     args = parser.parse_args()
 
@@ -237,6 +243,9 @@ def main():
     # 加载配置
     try:
         config = load_config()
+        # 如果通过参数指定了提示词版本，覆盖配置中的版本
+        if args.prompt_version:
+            config.prompt_version = args.prompt_version
     except ValueError as e:
         logger.error(f"配置错误: {e}")
         sys.exit(1)
@@ -288,9 +297,11 @@ def main():
         logger.info("=" * 60)
         logger.info("")
         
-        extractor = PointExtractor(config)
+        extractor = PointExtractor(config, prompt_version=config.prompt_version)
         logger.info(f"使用模型: {config.openai.model}")
         logger.info(f"API地址: {config.openai.base_url}")
+        if args.prompt_version:
+            logger.info(f"提示词版本: {config.prompt_version}")
         
         if args.force_extract:
             logger.info("⚠ 强制重新提取模式（忽略缓存）")
@@ -459,9 +470,11 @@ def main():
 
         # 提取要点清单
         try:
-            extractor = PointExtractor(config)
+            extractor = PointExtractor(config, prompt_version=config.prompt_version)
             logger.info(f"使用模型: {config.openai.model}")
             logger.info(f"API地址: {config.openai.base_url}")
+            if args.prompt_version:
+                logger.info(f"提示词版本: {config.prompt_version}")
             
             if args.force_extract:
                 logger.info("⚠ 强制重新提取模式（忽略缓存）")
@@ -498,9 +511,11 @@ def main():
     else:
         # 匹配模式：不在这里提取要点清单，而是为每个目标文档单独提取
         checkpoints = None
-        extractor = PointExtractor(config)
+        extractor = PointExtractor(config, prompt_version=config.prompt_version)
         logger.info(f"使用模型: {config.openai.model}")
         logger.info(f"API地址: {config.openai.base_url}")
+        if args.prompt_version:
+            logger.info(f"提示词版本: {config.prompt_version}")
         if args.force_extract:
             logger.info("⚠ 强制重新提取模式（忽略缓存）")
         else:
@@ -510,7 +525,7 @@ def main():
         logger.info("")
 
     # 评估文档（支持并行执行）
-    evaluator = Evaluator(config)
+    evaluator = Evaluator(config, prompt_version=config.prompt_version)
     evaluations = []
 
     # 确定是否并行执行
@@ -655,10 +670,11 @@ def main():
                     evaluation.evaluation_duration = time.time() - start_time
 
                 evaluations.append(evaluation)
+                # 计算投票通过和平均通过分数
+                voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
                 logger.info(
-                    f"✓ 评估完成 - 完整性: {evaluation.completeness:.2f}, "
-                    f"准确性: {evaluation.accuracy:.2f}, "
-                    f"综合: {evaluation.comprehensive:.2f}"
+                    f"✓ 评估完成 - 投票通过: {voting_score:.2f}, "
+                    f"平均通过: {average_score:.2f}"
                 )
                 logger.info("")
             except Exception as e:
@@ -730,11 +746,11 @@ def main():
     logger.info("-" * 60)
     for evaluation in evaluations:
         doc_name = Path(evaluation.target_document).name
+        voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
         logger.info(
             f"{doc_name}: "
-            f"完整性={evaluation.completeness:.2f}, "
-            f"准确性={evaluation.accuracy:.2f}, "
-            f"综合={evaluation.comprehensive:.2f}"
+            f"投票通过={voting_score:.2f}, "
+            f"平均通过={average_score:.2f}"
         )
     
     # 如果有多个评估结果，打印聚合统计
@@ -742,23 +758,23 @@ def main():
         logger.info("")
         logger.info("聚合统计:")
         logger.info("-" * 60)
-        completeness_scores = [e.completeness for e in evaluations]
-        accuracy_scores = [e.accuracy for e in evaluations]
-        comprehensive_scores = [e.comprehensive for e in evaluations]
+        # 计算投票通过和平均通过分数
+        voting_scores = []
+        average_scores = []
+        for evaluation in evaluations:
+            voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
+            voting_scores.append(voting_score)
+            average_scores.append(average_score)
+        
         logger.info(
-            f"完整性 - 平均: {statistics.mean(completeness_scores):.2f}, "
-            f"中位数: {statistics.median(completeness_scores):.2f}, "
-            f"范围: [{min(completeness_scores):.2f}, {max(completeness_scores):.2f}]"
+            f"投票通过 - 平均: {statistics.mean(voting_scores):.2f}, "
+            f"中位数: {statistics.median(voting_scores):.2f}, "
+            f"范围: [{min(voting_scores):.2f}, {max(voting_scores):.2f}]"
         )
         logger.info(
-            f"准确性 - 平均: {statistics.mean(accuracy_scores):.2f}, "
-            f"中位数: {statistics.median(accuracy_scores):.2f}, "
-            f"范围: [{min(accuracy_scores):.2f}, {max(accuracy_scores):.2f}]"
-        )
-        logger.info(
-            f"综合 - 平均: {statistics.mean(comprehensive_scores):.2f}, "
-            f"中位数: {statistics.median(comprehensive_scores):.2f}, "
-            f"范围: [{min(comprehensive_scores):.2f}, {max(comprehensive_scores):.2f}]"
+            f"平均通过 - 平均: {statistics.mean(average_scores):.2f}, "
+            f"中位数: {statistics.median(average_scores):.2f}, "
+            f"范围: [{min(average_scores):.2f}, {max(average_scores):.2f}]"
         )
 
 
