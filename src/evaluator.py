@@ -896,8 +896,11 @@ class Evaluator:
             "messages": [
                 {"role": "user", "content": prompt},
             ],
-            "temperature": self.config.openai.temperature,
         }
+        
+        # 只有当 temperature 配置了值时才添加到参数中
+        if self.config.openai.temperature is not None:
+            api_params["temperature"] = self.config.openai.temperature
         
         # 只有当 max_tokens 配置了值时才添加到参数中
         if self.config.openai.max_tokens is not None:
@@ -933,7 +936,7 @@ class Evaluator:
         api_params["stream"] = self.config.openai.stream
         
         # 记录API调用参数
-        logger.info(f"调用API - 模型: {api_params['model']}, temperature: {api_params['temperature']}, "
+        logger.info(f"调用API - 模型: {api_params['model']}, temperature: {api_params.get('temperature', 'None(使用API默认值)')}, "
                    f"max_tokens: {api_params.get('max_tokens', 'None')}")
         logger.debug(f"API参数: {json.dumps({k: v for k, v in api_params.items() if k != 'messages'}, ensure_ascii=False)}")
         

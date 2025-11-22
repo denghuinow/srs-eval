@@ -16,7 +16,7 @@ class OpenAIConfig(BaseModel):
     base_url: str = Field(
         default="https://api.openai.com/v1", description="API基础URL"
     )
-    temperature: float = Field(default=0.0, description="温度参数，固定为0确保可重复性")
+    temperature: Optional[float] = Field(default=None, description="温度参数，None时使用API默认值")
     max_tokens: Optional[int] = Field(default=None, description="最大token数，None时使用API默认值")
     timeout: float = Field(default=1800.0, description="API调用超时时间（秒）")
     max_retries: int = Field(default=5, description="最大重试次数")
@@ -81,11 +81,15 @@ def load_config() -> Config:
     if max_parse_retries < 0:
         max_parse_retries = 0
 
+    # 处理 temperature：如果环境变量存在则使用，否则为 None（使用 API 默认值）
+    temperature_env = os.getenv("TEMPERATURE")
+    temperature = float(temperature_env) if temperature_env else None
+
     openai_config = OpenAIConfig(
         api_key=api_key,
         model=os.getenv("OPENAI_MODEL", "gpt-4"),
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        temperature=float(os.getenv("TEMPERATURE", "0")),
+        temperature=temperature,
         max_tokens=max_tokens,
         timeout=float(os.getenv("OPENAI_TIMEOUT", "900")),
         max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3")),
