@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
@@ -32,9 +32,10 @@ class MergeStrategy(str, Enum):
 class CheckpointResult:
     """检查项结果"""
 
-    def __init__(self, checkpoint: str, passed: bool, pass_rate: float | None = None):
+    def __init__(self, checkpoint: str, passed: bool, pass_rate: Optional[float] = None, category: Optional[str] = None):
         self.checkpoint = checkpoint
         self.passed = passed
+        self.category = category  # 检查点所属维度（FUNCTIONAL, BUSINESS_FLOW, BOUNDARY, EXCEPTION, CONSISTENCY_RULE）
         # pass_rate: 通过率 (0.0-1.0)，用于加权平均计算
         # 如果未提供，则基于passed计算：passed=True时为1.0，False时为0.0
         if pass_rate is not None:
@@ -53,11 +54,11 @@ class DocumentEvaluation:
         target_document: str,
         checkpoints: list[str],
         checkpoint_results: list[CheckpointResult],
-        all_judge_results: list[list[CheckpointResult]] | None = None,
-        checkpoint_merge_result: "DocumentEvaluation | None" = None,
-        accuracy_merge_result: "DocumentEvaluation | None" = None,
-        model_name: str | None = None,
-        baseline_document: str | None = None,
+        all_judge_results: Optional[list[list[CheckpointResult]]] = None,
+        checkpoint_merge_result: Optional["DocumentEvaluation"] = None,
+        accuracy_merge_result: Optional["DocumentEvaluation"] = None,
+        model_name: Optional[str] = None,
+        baseline_document: Optional[str] = None,
     ):
         self.target_document = target_document
         self.checkpoints = checkpoints
@@ -71,14 +72,14 @@ class DocumentEvaluation:
         # 评估元信息
         self.model_name = model_name  # 使用的模型名称
         self.baseline_document = baseline_document  # 基准文档路径
-        self.evaluation_time: str | None = None  # 评估时间
-        self.evaluation_duration: float | None = None  # 评估耗时（秒）
+        self.evaluation_time: Optional[str] = None  # 评估时间
+        self.evaluation_duration: Optional[float] = None  # 评估耗时（秒）
 
 
 class Evaluator:
     """文档评估器"""
 
-    def __init__(self, config: Config | None = None, prompt_version: str | None = None):
+    def __init__(self, config: Optional[Config] = None, prompt_version: Optional[str] = None):
         """
         初始化评估器
 
@@ -170,25 +171,36 @@ class Evaluator:
         return text.strip()
     
     @staticmethod
-    def _format_checkpoints_as_csv(checkpoints: list[str]) -> str:
+    def _format_checkpoints_as_csv(checkpoints: list[str], checkpoints_with_category: Optional[list[tuple[str, str]]] = None) -> str:
         """
         将检查项列表格式化为TSV表格
         
         Args:
             checkpoints: 检查项列表
+            checkpoints_with_category: 带Category的检查项列表，格式为 [(category, checkpoint), ...]
+                                      如果提供，将使用此格式（v3版本）
             
         Returns:
-            TSV格式的字符串，包含表头：Index	Checkpoint（使用制表符分隔）
+            TSV格式的字符串
+            - v3版本：Index	Category	Checkpoint（使用制表符分隔）
+            - 旧版本：Index	Checkpoint（使用制表符分隔）
         """
         output = io.StringIO()
         writer = csv.writer(output, delimiter='\t')
         
-        # 写入表头
-        writer.writerow(["Index", "Checkpoint"])
-        
-        # 写入数据行
-        for index, checkpoint in enumerate(checkpoints):
-            writer.writerow([index, checkpoint])
+        # 如果提供了带Category的检查项，使用v3格式
+        if checkpoints_with_category is not None:
+            # 写入表头（v3格式）
+            writer.writerow(["Index", "Category", "Checkpoint"])
+            # 写入数据行
+            for index, (category, checkpoint) in enumerate(checkpoints_with_category):
+                writer.writerow([index, category, checkpoint])
+        else:
+            # 写入表头（旧格式）
+            writer.writerow(["Index", "Checkpoint"])
+            # 写入数据行
+            for index, checkpoint in enumerate(checkpoints):
+                writer.writerow([index, checkpoint])
         
         return output.getvalue()
     
@@ -243,13 +255,14 @@ class Evaluator:
         return True, ""
     
     @staticmethod
-    def _parse_tsv_result(tsv_text: str, checkpoints: list[str]) -> list[CheckpointResult]:
+    def _parse_tsv_result(tsv_text: str, checkpoints: list[str], category_map: Optional[dict[int, str]] = None) -> list[CheckpointResult]:
         """
         解析TSV格式的评估结果
 
         Args:
             tsv_text: TSV格式的文本
             checkpoints: 检查项列表（用于验证索引）
+            category_map: 索引到Category的映射（可选，用于v3版本）
 
         Returns:
             检查项结果列表
@@ -261,7 +274,7 @@ class Evaluator:
         # 使用csv模块解析TSV（指定delimiter为制表符）
         reader = csv.DictReader(io.StringIO(tsv_text), delimiter='\t')
 
-        # 构建索引到结果的映射
+        # 构建索引到结果的映射（包含Category信息）
         index_to_result = {}
         missing_result_count = 0
         for row in reader:
@@ -279,7 +292,14 @@ class Evaluator:
                     logger.debug(f"跳过非数据行（索引列不是数字）: {row}")
                     continue
                 
-                # 优先尝试从 Pass 列读取（新格式：Index, Pass）
+                # 提取Category信息（v3版本）
+                category = None
+                if "Category" in row:
+                    category = row["Category"].strip()
+                elif category_map and index in category_map:
+                    category = category_map[index]
+                
+                # 优先尝试从 Pass 列读取（新格式：Index, Pass 或 Index, Category, Pass）
                 result_str_raw = row.get("Pass", "")
                 result_str = (result_str_raw or "").strip().lower()
                 
@@ -324,7 +344,7 @@ class Evaluator:
 
                 # 验证索引有效性
                 if 0 <= index < len(checkpoints):
-                    index_to_result[index] = passed
+                    index_to_result[index] = (passed, category)
             except (ValueError, KeyError) as e:
                 logger.warning(f"解析TSV行失败: {row}, 错误: {e}")
                 continue
@@ -334,15 +354,21 @@ class Evaluator:
             logger.warning(
                 f"警告: 发现 {missing_result_count} 个检查项的判定结果列缺失或格式错误。"
                 f"这些检查项将被默认判定为未通过。"
-                f"请检查API返回的TSV格式是否正确，应包含两列：Index	Pass (或三列：Index	Reason	Result，使用制表符分隔)"
+                f"请检查API返回的TSV格式是否正确，应包含两列：Index	Pass (或三列：Index	Category	Pass，使用制表符分隔)"
             )
 
         # 构建检查项结果列表
         checkpoint_results = []
         for index, checkpoint in enumerate(checkpoints):
-            passed = index_to_result.get(index, False)
+            result = index_to_result.get(index, (False, None))
+            if isinstance(result, tuple):
+                passed, category = result
+            else:
+                # 兼容旧格式（只有passed值）
+                passed = result
+                category = None
             checkpoint_results.append(
-                CheckpointResult(checkpoint=checkpoint, passed=passed)
+                CheckpointResult(checkpoint=checkpoint, passed=passed, category=category)
             )
 
         return checkpoint_results
@@ -507,9 +533,9 @@ class Evaluator:
         self,
         api_params: dict[str, Any],
         accumulated_text: str,
-        finish_reason: str | None,
+        finish_reason: Optional[str],
         task_name: str = "文档评估",
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, Optional[str]]:
         """
         如果模型因为达到max_tokens而提前结束，自动请求接续
         
@@ -824,7 +850,7 @@ class Evaluator:
     def evaluate_single_run(
         self,
         checkpoints: list[str],
-        target_document_path: str | Path,
+        target_document_path: Union[str, Path],
     ) -> DocumentEvaluation:
         """
         单次评估运行
@@ -845,20 +871,74 @@ class Evaluator:
         template = self._load_prompt_template("evaluate_points.md")
 
         # 去除检查项中的重复项（保持顺序）
+        # 同时检查checkpoints是否是"Category\tCheckpoint"格式
         original_count = len(checkpoints)
         seen = set()
         unique_checkpoints = []
-        for checkpoint in checkpoints:
-            if checkpoint not in seen:
-                seen.add(checkpoint)
-                unique_checkpoints.append(checkpoint)
+        checkpoints_with_category = None
+        
+        # 检查第一个checkpoint是否包含Category信息（格式：Category\tCheckpoint）
+        has_category_format = False
+        if checkpoints and '\t' in checkpoints[0]:
+            # 尝试解析第一个检查点，看是否是Category\tCheckpoint格式
+            parts = checkpoints[0].split('\t', 1)
+            if len(parts) == 2 and parts[0].strip() in ['FUNCTIONAL', 'BUSINESS_FLOW', 'BOUNDARY', 'EXCEPTION', 'CONSISTENCY_RULE']:
+                has_category_format = True
+        
+        if has_category_format and self.prompt_version == "v3":
+            # 解析带Category格式的checkpoints
+            checkpoints_with_category = []
+            checkpoint_set = set()  # 用于去重（基于检查点文本）
+            
+            for checkpoint_line in checkpoints:
+                if '\t' in checkpoint_line:
+                    parts = checkpoint_line.split('\t', 1)
+                    if len(parts) == 2:
+                        category = parts[0].strip()
+                        checkpoint = parts[1].strip()
+                        if checkpoint and checkpoint not in checkpoint_set:
+                            checkpoint_set.add(checkpoint)
+                            unique_checkpoints.append(checkpoint)
+                            checkpoints_with_category.append((category, checkpoint))
+                else:
+                    # 如果没有Category，只添加检查点文本
+                    if checkpoint_line not in seen:
+                        seen.add(checkpoint_line)
+                        unique_checkpoints.append(checkpoint_line)
+        else:
+            # 旧格式：只有检查点文本
+            for checkpoint in checkpoints:
+                # 如果checkpoint包含\t，可能是旧缓存中的格式，只取检查点部分
+                if '\t' in checkpoint:
+                    checkpoint = checkpoint.split('\t', 1)[-1]  # 取最后一部分作为检查点
+                if checkpoint not in seen:
+                    seen.add(checkpoint)
+                    unique_checkpoints.append(checkpoint)
         
         if original_count != len(unique_checkpoints):
             logger.info(f"去重前检查项数量: {original_count}, 去重后: {len(unique_checkpoints)} (已去除 {original_count - len(unique_checkpoints)} 个重复项)")
         
         # 准备检查项TSV表格
-        checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints)
+        
+        checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints, checkpoints_with_category)
         logger.debug(f"检查项数量: {len(unique_checkpoints)}, TSV长度: {len(checkpoints_table)} 字符")
+        
+        # 如果使用v3版本，从checkpoints_table中解析Category映射（用于后续解析评估结果）
+        category_map = {}
+        if self.prompt_version == "v3":
+            try:
+                reader = csv.DictReader(io.StringIO(checkpoints_table), delimiter='\t')
+                for row in reader:
+                    if "Index" in row and "Category" in row and "Checkpoint" in row:
+                        try:
+                            index = int(row["Index"])
+                            category = row["Category"].strip()
+                            if index < len(unique_checkpoints):
+                                category_map[index] = category
+                        except (ValueError, KeyError):
+                            continue
+            except Exception as e:
+                logger.debug(f"解析Category映射失败: {e}")
 
         # 填充模板
         prompt = template.format(
@@ -1017,7 +1097,7 @@ class Evaluator:
             
             # 尝试解析TSV格式的结果
             try:
-                checkpoint_results = self._parse_tsv_result(cleaned_text, unique_checkpoints)
+                checkpoint_results = self._parse_tsv_result(cleaned_text, unique_checkpoints, category_map)
                 
                 # 验证解析结果是否有效
                 is_valid, error_msg = self._validate_parse_result(
@@ -1071,10 +1151,10 @@ class Evaluator:
     def evaluate_multiple_runs(
         self,
         checkpoints: list[str],
-        target_document_path: str | Path,
+        target_document_path: Union[str, Path],
         runs: int = 3,
-        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
-        baseline_document_path: str | Path | None = None,
+        merge_strategy: Union[MergeStrategy, str] = MergeStrategy.ACCURACY_AVERAGE,
+        baseline_document_path: Optional[Union[str, Path]] = None,
     ) -> DocumentEvaluation:
         """
         多次运行评估并合并结果（并行执行）
@@ -1182,8 +1262,8 @@ class Evaluator:
         self,
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
-        target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
+        target_document_path: Union[str, Path],
+        merge_strategy: Union[MergeStrategy, str] = MergeStrategy.ACCURACY_AVERAGE,
     ) -> DocumentEvaluation:
         """
         准确性合并策略：对每个评委的通过项数量进行平均计算
@@ -1225,7 +1305,7 @@ class Evaluator:
         self,
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
-        target_document_path: str | Path,
+        target_document_path: Union[str, Path],
         merge_strategy: MergeStrategy | str = MergeStrategy.CHECKPOINT_MAJORITY,
     ) -> DocumentEvaluation:
         """

@@ -7,7 +7,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class PointExtractor:
     """从基准文档提取结构化要点清单"""
 
-    def __init__(self, config: Config | None = None, prompt_version: str | None = None):
+    def __init__(self, config: Optional[Config] = None, prompt_version: Optional[str] = None):
         """
         初始化要点提取器
 
@@ -122,7 +122,7 @@ class PointExtractor:
             )
         return template_path.read_text(encoding="utf-8")
 
-    def _get_cache_path(self, document_path: str | Path) -> Path:
+    def _get_cache_path(self, document_path: Union[str, Path]) -> Path:
         """
         获取缓存文件路径
 
@@ -157,26 +157,42 @@ class PointExtractor:
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _save_points_cache(
-        self, document_path: str | Path, checkpoints: list[str], content_hash: str
+        self, document_path: Union[str, Path], checkpoints: list[str], content_hash: str, 
+        checkpoints_with_category: Optional[list[tuple[str, str]]] = None
     ) -> None:
         """
         保存检查项清单到缓存文件
 
         Args:
             document_path: 文档路径
-            checkpoints: 检查项清单
+            checkpoints: 检查项清单（纯文本列表）
             content_hash: 文档内容hash
+            checkpoints_with_category: 带Category的检查项列表（v3版本），格式为 [(category, checkpoint), ...]
         """
         cache_path = self._get_cache_path(document_path)
-        cache_data = {
-            "document_path": str(Path(document_path).absolute()),
-            "content_hash": content_hash,
-            "checkpoints": checkpoints,
-        }
+        
+        # 如果使用v3版本且有Category信息，将checkpoints保存为"Category\tCheckpoint"格式
+        if checkpoints_with_category and self.prompt_version == "v3":
+            # 保存为带Category格式：["FUNCTIONAL\t检查点1", "BOUNDARY\t检查点2", ...]
+            checkpoints_with_cat_format = [f"{cat}\t{cp}" for cat, cp in checkpoints_with_category]
+            cache_data = {
+                "document_path": str(Path(document_path).absolute()),
+                "content_hash": content_hash,
+                "checkpoints": checkpoints_with_cat_format,  # 保存为带Category格式
+                "checkpoints_with_category": checkpoints_with_category,  # 同时保存结构化数据
+            }
+        else:
+            # 旧格式：只保存检查点文本
+            cache_data = {
+                "document_path": str(Path(document_path).absolute()),
+                "content_hash": content_hash,
+                "checkpoints": checkpoints,
+            }
+        
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
-    def has_cache(self, document_path: str | Path, content_hash: str | None = None) -> bool:
+    def has_cache(self, document_path: Union[str, Path], content_hash: Optional[str] = None) -> bool:
         """
         检查缓存是否存在且有效（不加载内容，只检查）
         通过遍历所有缓存文件，使用content_hash匹配
@@ -214,8 +230,8 @@ class PointExtractor:
         return False
 
     def _load_points_cache(
-        self, document_path: str | Path, content_hash: str | None = None
-    ) -> list[str] | None:
+        self, document_path: Union[str, Path], content_hash: Optional[str] = None
+    ) -> Optional[list[str]]:
         """
         从缓存文件加载检查项清单
         通过遍历所有缓存文件，使用content_hash匹配
@@ -382,10 +398,10 @@ class PointExtractor:
         self,
         api_params: dict[str, Any],
         accumulated_text: str,
-        finish_reason: str | None,
+        finish_reason: Optional[str],
         task_name: str = "要点提取",
-        document_path: str | Path | None = None,
-    ) -> tuple[str, str | None]:
+        document_path: Optional[Union[str, Path]] = None,
+    ) -> tuple[str, Optional[str]]:
         """
         当模型因为max_tokens截断时自动发送接续请求
         
@@ -500,8 +516,8 @@ class PointExtractor:
         return combined_text, finish_reason
 
     def _extract_points_single(
-        self, content: str, document_path: str | Path | None = None
-    ) -> list[str]:
+        self, content: str, document_path: Optional[Union[str, Path]] = None
+    ) -> tuple[list[str], Optional[list[tuple[str, str]]]]:
         """
         单次提取检查项清单（内部方法）
 
@@ -510,7 +526,9 @@ class PointExtractor:
             document_path: 文档路径（用于日志记录）
 
         Returns:
-            检查项清单（平铺的checkpoints数组）
+            (checkpoints, checkpoints_with_category)
+            - checkpoints: 检查项清单（平铺的checkpoints数组）
+            - checkpoints_with_category: 带Category的检查项列表（v3版本），格式为 [(category, checkpoint), ...]，如果无Category则为None
         """
         # 构建日志前缀，包含文件信息
         log_prefix = f"[{Path(document_path).name}] " if document_path else ""
@@ -650,7 +668,43 @@ class PointExtractor:
         logger.debug(f"{log_prefix}{'=' * 80}")
 
         try:
-            # 按行解析检查项
+            # 检查是否是TSV格式（v3版本：Category	Checkpoint）
+            import csv
+            import io
+            
+            # 尝试按TSV格式解析
+            try:
+                reader = csv.DictReader(io.StringIO(cleaned_text), delimiter='\t')
+                checkpoints = []
+                checkpoints_with_category = []  # 存储带Category的检查点（用于v3版本）
+                has_category = False
+                
+                for row in reader:
+                    # v3格式：Category	Checkpoint
+                    if "Category" in row and "Checkpoint" in row:
+                        has_category = True
+                        category = row["Category"].strip()
+                        checkpoint = row["Checkpoint"].strip()
+                        if checkpoint:
+                            checkpoints.append(checkpoint)
+                            checkpoints_with_category.append((category, checkpoint))
+                    # 兼容旧格式：只有Checkpoint列
+                    elif "Checkpoint" in row:
+                        checkpoint = row["Checkpoint"].strip()
+                        if checkpoint:
+                            checkpoints.append(checkpoint)
+                
+                if checkpoints:
+                    if has_category:
+                        logger.info(f"{log_prefix}成功解析TSV格式（v3，带Category），提取到 {len(checkpoints)} 个检查项")
+                        return checkpoints, checkpoints_with_category
+                    else:
+                        logger.info(f"{log_prefix}成功解析TSV格式，提取到 {len(checkpoints)} 个检查项")
+                        return checkpoints, None
+            except Exception as e:
+                logger.debug(f"{log_prefix}TSV解析失败，尝试按行解析: {e}")
+            
+            # 如果不是TSV格式，按行解析（兼容旧格式）
             checkpoints = []
             lines = cleaned_text.split('\n')
             
@@ -658,6 +712,9 @@ class PointExtractor:
                 line = line.strip()
                 # 跳过空行
                 if not line:
+                    continue
+                # 跳过表头行（如果存在）
+                if line.lower().startswith("category") or line.lower().startswith("checkpoint"):
                     continue
                 # 跳过明显的编号或标记（如 "1. ", "- ", "* " 等）
                 line = self._remove_numbering(line)
@@ -671,7 +728,7 @@ class PointExtractor:
                 raise ValueError("未提取到任何检查项")
             
             logger.info(f"{log_prefix}成功解析文本，提取到 {len(checkpoints)} 个检查项")
-            return checkpoints
+            return checkpoints, None
         except Exception as e:
             # 提供更详细的错误信息
             error_preview = result_text[:500] if len(result_text) > 500 else result_text
@@ -687,7 +744,7 @@ class PointExtractor:
 
     def extract_points(
         self,
-        document_path: str | Path,
+        document_path: Union[str, Path],
         force_extract: bool = False,
         extract_runs: int = 1,
     ) -> list[str]:
@@ -720,20 +777,21 @@ class PointExtractor:
 
         # 缓存不存在或强制重新提取，调用API提取
         logger.info(f"开始提取检查项，文档: {document_path}, 提取次数: {extract_runs}, 强制提取: {force_extract}")
+        checkpoints_with_category = None
         if extract_runs <= 1:
             # 单次提取
-            checkpoints = self._extract_points_single(content, document_path=document_path)
+            checkpoints, checkpoints_with_category = self._extract_points_single(content, document_path=document_path)
             logger.info(f"✓ 成功提取 {len(checkpoints)} 个检查项")
         else:
             # 多次提取，并行执行，选择检查项数量最多的结果
             logger.info(f"正在并行执行 {extract_runs} 次提取，选择检查项数量最多的结果...")
             all_results = []
             
-            def extract_with_index(i: int) -> tuple[int, list[str]]:
+            def extract_with_index(i: int):
                 """带索引的提取函数，用于并行执行"""
                 try:
-                    checkpoints = self._extract_points_single(content, document_path=document_path)
-                    return (i, checkpoints)
+                    result = self._extract_points_single(content, document_path=document_path)
+                    return (i, result)
                 except Exception as e:
                     logger.error(f"  第 {i+1}/{extract_runs} 次提取失败: {e}")
                     logger.debug(f"提取失败详情:", exc_info=True)
@@ -749,25 +807,27 @@ class PointExtractor:
                 completed = 0
                 for future in as_completed(futures):
                     completed += 1
-                    i, checkpoints = future.result()
-                    if checkpoints is not None:
-                        all_results.append(checkpoints)
-                        logger.info(f"  [{completed}/{extract_runs}] 第 {i+1} 次提取完成: {len(checkpoints)} 个检查项")
+                    i, result = future.result()
+                    if result is not None:
+                        all_results.append(result)
+                        cp, cp_cat = result
+                        logger.info(f"  [{completed}/{extract_runs}] 第 {i+1} 次提取完成: {len(cp)} 个检查项")
             
             if not all_results:
                 raise ValueError("所有提取尝试均失败")
             
             # 选择检查项数量最多的结果
-            checkpoints = max(all_results, key=len)
+            best_result = max(all_results, key=lambda x: len(x[0]))
+            checkpoints, checkpoints_with_category = best_result
             logger.info(f"✓ 选择最优结果：{len(checkpoints)} 个检查项（从 {len(all_results)} 次成功提取中选择）")
             
             # 显示其他结果的统计信息
             if len(all_results) > 1:
-                checkpoint_counts = [len(cp) for cp in all_results]
+                checkpoint_counts = [len(cp) for cp, _ in all_results]
                 logger.info(f"  提取结果统计（检查项数量）：最少 {min(checkpoint_counts)} 个，最多 {max(checkpoint_counts)} 个，平均 {sum(checkpoint_counts)/len(checkpoint_counts):.1f} 个")
         
-        # 保存到缓存
-        self._save_points_cache(document_path, checkpoints, content_hash)
+        # 保存到缓存（包含Category信息）
+        self._save_points_cache(document_path, checkpoints, content_hash, checkpoints_with_category)
         cache_path = self._get_cache_path(document_path)
         logger.info(f"✓ 检查项清单已保存到缓存: {cache_path}")
         
