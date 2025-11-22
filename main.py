@@ -153,7 +153,7 @@ def find_matching_baseline(target_file: Path, baseline_dir: Path) -> Path | None
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description="需求文档差异评估系统 - 基于大模型评估需求文档的完整性和准确性"
+        description="需求文档差异评估系统 - 基于大模型评估需求文档"
     )
     parser.add_argument(
         "--baseline",
@@ -611,11 +611,11 @@ def main():
                     if use_matching_mode and evaluation.baseline_document:
                         baseline_name = Path(evaluation.baseline_document).name
                         baseline_info = f" (基准: {baseline_name})"
+                    voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
                     logger.info(
                         f"[{completed}/{len(target_paths)}] ✓ {target_path.name}{baseline_info} - "
-                        f"完整性: {evaluation.completeness:.2f}, "
-                        f"准确性: {evaluation.accuracy:.2f}, "
-                        f"综合: {evaluation.comprehensive:.2f}"
+                        f"投票通过: {voting_score:.2f}, "
+                        f"平均通过: {average_score:.2f}"
                     )
         logger.info("")
     else:

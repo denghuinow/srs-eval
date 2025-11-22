@@ -74,23 +74,6 @@ class DocumentEvaluation:
         self.evaluation_time: str | None = None  # 评估时间
         self.evaluation_duration: float | None = None  # 评估耗时（秒）
 
-        # 计算分数
-        total_checkpoints = len(checkpoints)
-        if total_checkpoints == 0:
-            self.completeness = 0.0
-            self.accuracy = 0.0
-            self.comprehensive = 0.0
-        else:
-            # 准确性：基于检查项通过情况计算
-            passed_checkpoints = sum(1 for cp in checkpoint_results if cp.passed)
-            self.accuracy = (passed_checkpoints / total_checkpoints) * 100 if total_checkpoints > 0 else 0.0
-
-            # 完整性：与准确性相同（因为不再有points层级）
-            self.completeness = self.accuracy
-
-            # 综合分数：完整性 × 0.5 + 准确性 × 0.5（实际上两者相同）
-            self.comprehensive = self.accuracy
-
 
 class Evaluator:
     """文档评估器"""
@@ -1052,8 +1035,6 @@ class Evaluator:
                     checkpoints=unique_checkpoints,
                     checkpoint_results=checkpoint_results,
                 )
-                logger.info(f"评估完成 - 准确性: {evaluation.accuracy:.2f}, "
-                           f"综合: {evaluation.comprehensive:.2f}")
                 
                 # 如果之前有重试，记录成功信息
                 if parse_attempt > 0:
@@ -1162,10 +1143,11 @@ class Evaluator:
         )
         
         # 策略2：准确性合并 - 对每个评委的通过项数量进行平均计算
-        accuracy_scores = [r.accuracy for r in results]
-        merged_accuracy = statistics.mean(accuracy_scores)
-        merged_completeness = statistics.mean([r.completeness for r in results])
-        merged_comprehensive = statistics.mean([r.comprehensive for r in results])
+        # 计算每个评委的通过项数量
+        passed_counts = [
+            sum(1 for cp in r.checkpoint_results if cp.passed)
+            for r in results
+        ]
         
         first_result = results[0]
         accuracy_merge_result = DocumentEvaluation(
@@ -1174,9 +1156,6 @@ class Evaluator:
             checkpoint_results=first_result.checkpoint_results,
             all_judge_results=all_judge_results,
         )
-        accuracy_merge_result.accuracy = merged_accuracy
-        accuracy_merge_result.completeness = merged_completeness
-        accuracy_merge_result.comprehensive = merged_comprehensive
 
         # 根据指定策略选择返回哪个结果，但保存两种策略的结果
         if merge_strategy == MergeStrategy.CHECKPOINT_MAJORITY:
@@ -1226,34 +1205,19 @@ class Evaluator:
         if runs == 1:
             return raw_results[0]
 
-        # 收集每个评委的准确性、完整性和综合分数
-        accuracy_scores = [r.accuracy for r in raw_results]
-        completeness_scores = [r.completeness for r in raw_results]
-        comprehensive_scores = [r.comprehensive for r in raw_results]
-
-        # 使用平均值合并
-        merged_accuracy = statistics.mean(accuracy_scores)
-        merged_completeness = statistics.mean(completeness_scores)
-        merged_comprehensive = statistics.mean(comprehensive_scores)
-
         # 使用第一个评委的详细评估结果（checkpoint_results字段）
         first_result = raw_results[0]
 
         # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
         all_judge_results = [r.checkpoint_results for r in raw_results]
 
-        # 创建最终结果对象，手动设置合并后的分数
+        # 创建最终结果对象
         final_result = DocumentEvaluation(
             target_document=str(target_document_path),
             checkpoints=checkpoints,
             checkpoint_results=first_result.checkpoint_results,
             all_judge_results=all_judge_results,
         )
-        
-        # 覆盖计算出的分数，使用合并后的分数
-        final_result.accuracy = merged_accuracy
-        final_result.completeness = merged_completeness
-        final_result.comprehensive = merged_comprehensive
 
         return final_result
 
@@ -1326,259 +1290,4 @@ class Evaluator:
         )
         
         return final_result
-
-    def _merge_accuracy_by_strategy(
-        self,
-        accuracy_scores: list[float],
-        strategy: MergeStrategy | str,
-    ) -> float:
-        """
-        根据策略合并准确性分数列表
-        
-        支持的策略：
-        - AVERAGE: 平均值，适用于评委水平相近、分布正常时
-        - MEDIAN: 中位数，适用于存在异常值或评委差异较大时，抗异常值能力强
-        - MAJORITY: 多数投票，返回平均值（与AVERAGE相同）
-        - CONSENSUS_67: 2/3一致性，如果2/3以上评委给出>50分则返回平均值，否则返回较低值
-        - CONSENSUS_75: 3/4一致性，如果3/4以上评委给出>50分则返回平均值，否则返回较低值
-        - WEIGHTED: 加权投票，根据标准差自动调整权重，一致性越高权重越大
-        - CONFIDENCE: 置信区间法，标准差小时使用平均值，大时使用中位数（更保守）
-        - TRIMMED_MEAN: 截断均值，去除最高和最低10%分数后取平均，抗异常值但比中位数更充分利用信息
-        - QUANTILE_WEIGHTED: 分位数加权，中间分位数（接近0.5）的分数权重更大，认为中间位置评分更可靠
-        - BAYESIAN_AVERAGE: 贝叶斯平均，结合先验信息（默认50分），样本量小时更依赖先验，样本量大时更依赖数据
-        
-        Args:
-            accuracy_scores: 准确性分数列表（0-100之间的值）
-            strategy: 合并策略
-        
-        Returns:
-            合并后的准确性分数（0-100）
-        """
-        if not accuracy_scores:
-            return 0.0
-        
-        # 如果只有一个分数，直接返回
-        if len(accuracy_scores) == 1:
-            return accuracy_scores[0]
-        
-        # 处理字符串类型的策略
-        if isinstance(strategy, str):
-            try:
-                strategy = MergeStrategy(strategy)
-            except ValueError:
-                strategy = MergeStrategy.AVERAGE
-        
-        if strategy == MergeStrategy.AVERAGE:
-            # 平均值
-            return statistics.mean(accuracy_scores)
-        
-        elif strategy == MergeStrategy.MEDIAN:
-            # 中位数
-            return statistics.median(accuracy_scores)
-        
-        elif strategy == MergeStrategy.MAJORITY:
-            # 多数投票：>50%的评委给出>50分则认为通过，返回平均值
-            # 这里我们计算平均值，但逻辑上可以理解为多数评委的平均
-            return statistics.mean(accuracy_scores)
-        
-        elif strategy == MergeStrategy.CONSENSUS_67:
-            # 2/3一致性：如果2/3以上的评委给出>50分，返回平均值
-            threshold = 2.0 / 3.0
-            passing_count = sum(1 for score in accuracy_scores if score > 50.0)
-            if passing_count / len(accuracy_scores) >= threshold:
-                return statistics.mean(accuracy_scores)
-            else:
-                # 未达到一致性，返回较低的值（平均值和最低值的加权）
-                return statistics.mean(accuracy_scores) * 0.7 + min(accuracy_scores) * 0.3
-        
-        elif strategy == MergeStrategy.CONSENSUS_75:
-            # 3/4一致性：如果3/4以上的评委给出>50分，返回平均值
-            threshold = 0.75
-            passing_count = sum(1 for score in accuracy_scores if score > 50.0)
-            if passing_count / len(accuracy_scores) >= threshold:
-                return statistics.mean(accuracy_scores)
-            else:
-                # 未达到一致性，返回较低的值
-                return statistics.mean(accuracy_scores) * 0.7 + min(accuracy_scores) * 0.3
-        
-        elif strategy == MergeStrategy.WEIGHTED:
-            # 加权投票：一致性越高权重越大
-            # 计算标准差，标准差越小权重越大
-            if len(accuracy_scores) > 1:
-                std_dev = statistics.stdev(accuracy_scores)
-                mean_score = statistics.mean(accuracy_scores)
-                # 归一化标准差（假设最大标准差为50）
-                normalized_std = min(std_dev / 50.0, 1.0)
-                weight = 1.0 - normalized_std * 0.5  # 权重在0.5-1.0之间
-                return mean_score * weight + statistics.median(accuracy_scores) * (1 - weight)
-            else:
-                return accuracy_scores[0]
-        
-        elif strategy == MergeStrategy.CONFIDENCE:
-            # 置信区间法：只使用高置信度结果（标准差小的结果）
-            if len(accuracy_scores) > 1:
-                std_dev = statistics.stdev(accuracy_scores)
-                mean_score = statistics.mean(accuracy_scores)
-                # 如果标准差小（<10），使用平均值；否则保守处理
-                if std_dev < 10.0:
-                    return mean_score
-                else:
-                    # 低置信度时使用中位数（更保守）
-                    return statistics.median(accuracy_scores)
-            else:
-                return accuracy_scores[0]
-        
-        elif strategy == MergeStrategy.TRIMMED_MEAN:
-            # 截断均值：去除最高和最低的10%分数（至少1个，最多去除总数的一半）后取平均
-            if len(accuracy_scores) <= 2:
-                # 如果只有2个或更少，直接返回平均值
-                return statistics.mean(accuracy_scores)
-            
-            sorted_scores = sorted(accuracy_scores)
-            n = len(sorted_scores)
-            # 计算需要去除的数量：10%，至少1个，最多n//2
-            trim_count = max(1, min(int(n * 0.1), n // 2))
-            
-            # 去除最高和最低的 trim_count 个分数
-            trimmed_scores = sorted_scores[trim_count:-trim_count] if trim_count > 0 else sorted_scores
-            
-            if trimmed_scores:
-                return statistics.mean(trimmed_scores)
-            else:
-                # 如果去除后没有剩余分数，返回中位数
-                return statistics.median(accuracy_scores)
-        
-        elif strategy == MergeStrategy.QUANTILE_WEIGHTED:
-            # 分位数加权：根据分数在分布中的位置分配权重，中间分位数权重更大
-            if len(accuracy_scores) <= 1:
-                return accuracy_scores[0] if accuracy_scores else 0.0
-            
-            sorted_scores = sorted(accuracy_scores)
-            n = len(sorted_scores)
-            weighted_sum = 0.0
-            total_weight = 0.0
-            
-            for i, score in enumerate(sorted_scores):
-                # 计算分位数位置（0到1之间）
-                quantile = (i + 0.5) / n
-                # 权重函数：中间分位数（接近0.5）权重最大
-                # 使用二次函数，使权重分布更平滑，峰值在0.5
-                # weight = 1.0 - (quantile - 0.5) ** 2 * 4
-                # 这样中间位置（0.5）权重为1.0，两端（0和1）权重为0
-                weight = 1.0 - (quantile - 0.5) ** 2 * 4
-                weight = max(0.0, weight)  # 确保权重非负
-                weighted_sum += score * weight
-                total_weight += weight
-            
-            if total_weight > 0:
-                return weighted_sum / total_weight
-            else:
-                return statistics.mean(accuracy_scores)
-        
-        elif strategy == MergeStrategy.BAYESIAN_AVERAGE:
-            # 贝叶斯平均：使用先验均值（默认50分）和样本均值加权
-            # 样本量小时更依赖先验，样本量大时更依赖数据
-            prior_mean = 50.0  # 先验均值（假设平均分数为50）
-            prior_weight = 1.0  # 先验权重（相当于1个样本）
-            
-            sample_mean = statistics.mean(accuracy_scores)
-            sample_size = len(accuracy_scores)
-            
-            # 贝叶斯平均 = (先验均值 * 先验权重 + 样本均值 * 样本量) / (先验权重 + 样本量)
-            bayesian_mean = (prior_mean * prior_weight + sample_mean * sample_size) / (prior_weight + sample_size)
-            
-            return bayesian_mean
-        
-        else:
-            # 默认使用平均值
-            return statistics.mean(accuracy_scores)
-
-    def _merge_checkpoint_by_strategy(
-        self,
-        votes: dict,
-        runs: int,
-        exists: bool,
-        strategy: MergeStrategy | str,
-    ) -> tuple[float, bool]:
-        """
-        根据策略合并检查项结果
-        
-        Args:
-            votes: 投票统计 {"passed_count": int, "total_count": int, "pass_rates": list[float]}
-            runs: 运行次数
-            exists: 要点是否存在
-            strategy: 合并策略
-        
-        Returns:
-            (pass_rate, passed) 元组
-        """
-        if not exists:
-            return 0.0, False
-        
-        passed_count = votes["passed_count"]
-        total_count = votes["total_count"]
-        pass_ratio = passed_count / total_count if total_count > 0 else 0.0
-        
-        # 处理字符串类型的策略
-        if isinstance(strategy, str):
-            try:
-                strategy = MergeStrategy(strategy)
-            except ValueError:
-                strategy = MergeStrategy.AVERAGE
-        
-        if strategy == MergeStrategy.AVERAGE:
-            # 当前方法：使用通过率
-            passed = pass_ratio >= 0.5
-            return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.MAJORITY:
-            # 多数投票：>50%
-            passed = pass_ratio > 0.5
-            return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.CONSENSUS_67:
-            # 2/3一致性
-            threshold = 2.0 / 3.0
-            passed = pass_ratio >= threshold
-            return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.CONSENSUS_75:
-            # 3/4一致性
-            threshold = 0.75
-            passed = pass_ratio >= threshold
-            return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.MEDIAN:
-            # 中位数：计算所有评委 pass_rate 的中位数
-            pass_rates = votes.get("pass_rates", [])
-            if pass_rates:
-                median_rate = statistics.median(pass_rates)
-                passed = median_rate >= 0.5
-                return median_rate, passed
-            else:
-                # 如果没有 pass_rates，回退到使用 pass_ratio
-                passed = pass_ratio >= 0.5
-                return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.WEIGHTED:
-            # 加权投票：一致性越高权重越大
-            weight = pass_ratio ** 1.5
-            weighted_rate = pass_ratio * weight
-            passed = weighted_rate >= 0.5
-            return pass_ratio, passed
-        
-        elif strategy == MergeStrategy.CONFIDENCE:
-            # 置信区间法：只使用高置信度结果
-            confidence = abs(pass_ratio - 0.5) * 2  # 0.0-1.0
-            if confidence > 0.3:  # 置信度>30%
-                passed = pass_ratio > 0.5
-            else:
-                # 低置信度时保守处理
-                passed = False
-            return pass_ratio, passed
-        
-        else:
-            # 默认使用平均值
-            passed = pass_ratio >= 0.5
-            return pass_ratio, passed
 

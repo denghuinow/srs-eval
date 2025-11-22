@@ -31,12 +31,14 @@ class OutputFormatter:
             for cp in evaluation.checkpoint_results
         ]
 
+        # 计算投票通过和平均通过分数
+        voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
+        
         return {
             "target_document": evaluation.target_document,
             "scores": {
-                "completeness": round(evaluation.completeness, 2),
-                "accuracy": round(evaluation.accuracy, 2),
-                "comprehensive": round(evaluation.comprehensive, 2),
+                "voting_score": round(voting_score, 2),
+                "average_score": round(average_score, 2),
             },
             "checkpoints": evaluation.checkpoints,
             "checkpoint_results": checkpoint_results_data,
@@ -59,19 +61,19 @@ class OutputFormatter:
         rows = []
         for eval_result in evaluations:
             doc_name = Path(eval_result.target_document).name
+            voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(eval_result)
             rows.append(
                 {
                     "文档名": doc_name,
-                    "完整性分数": round(eval_result.completeness, 2),
-                    "准确性分数": round(eval_result.accuracy, 2),
-                    "综合分数": round(eval_result.comprehensive, 2),
+                    "投票通过": round(voting_score, 2),
+                    "平均通过": round(average_score, 2),
                 }
             )
 
         if output_path:
             with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.DictWriter(
-                    f, fieldnames=["文档名", "完整性分数", "准确性分数", "综合分数"]
+                    f, fieldnames=["文档名", "投票通过", "平均通过"]
                 )
                 writer.writeheader()
                 writer.writerows(rows)
@@ -79,15 +81,14 @@ class OutputFormatter:
         else:
             # 返回字符串
             output = []
-            output.append(",".join(["文档名", "完整性分数", "准确性分数", "综合分数"]))
+            output.append(",".join(["文档名", "投票通过", "平均通过"]))
             for row in rows:
                 output.append(
                     ",".join(
                         [
                             row["文档名"],
-                            str(row["完整性分数"]),
-                            str(row["准确性分数"]),
-                            str(row["综合分数"]),
+                            str(row["投票通过"]),
+                            str(row["平均通过"]),
                         ]
                     )
                 )
@@ -133,10 +134,6 @@ class OutputFormatter:
         # 如果有多个评委的结果，显示两种策略的结果
         if evaluation.all_judge_results and len(evaluation.all_judge_results) > 1:
             num_judges = len(evaluation.all_judge_results)
-            
-            # 获取两种策略的结果
-            checkpoint_result = evaluation.checkpoint_merge_result if evaluation.checkpoint_merge_result else evaluation
-            accuracy_result = evaluation.accuracy_merge_result if evaluation.accuracy_merge_result else evaluation
             
             # 计算多数投票统计（用于检查项合并策略）
             majority_passed_count = 0
@@ -186,19 +183,14 @@ class OutputFormatter:
             lines.append("")
         else:
             # 只有一个评委或没有保存多个评委结果，只显示基本统计
-            lines.append("| 项目 | 数值 |")
-            lines.append("|------|------|")
-            lines.append(f"| 检查项总数 | {total_checkpoints} |")
+            voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
+            passed_count = sum(1 for cp in evaluation.checkpoint_results if cp.passed)
             
-            # 如果完整性、准确性和综合分数都相同，合并显示
-            if (abs(evaluation.completeness - evaluation.accuracy) < 0.01 and 
-                abs(evaluation.accuracy - evaluation.comprehensive) < 0.01):
-                lines.append(f"| 综合分数 | {evaluation.completeness:.2f} |")
-            else:
-                lines.append(f"| 完整性分数 | {evaluation.completeness:.2f} |")
-                lines.append(f"| 准确性分数 | {evaluation.accuracy:.2f} |")
-                lines.append(f"| 综合分数 | {evaluation.comprehensive:.2f} |")
-            
+            lines.append("| 项目 | 数量 | 得分 |")
+            lines.append("|:-----|:----:|:----:|")
+            lines.append(f"| 检查项总数 | {total_checkpoints} | - |")
+            lines.append(f"| 投票通过 | {passed_count} | {voting_score:.2f} |")
+            lines.append(f"| 平均通过 | {passed_count} | {average_score:.2f} |")
             lines.append("")
 
         # 检查项详细结果
@@ -326,8 +318,10 @@ class OutputFormatter:
             
             return voting_score, average_score
         else:
-            # 只有一个评委或没有保存多个评委结果，使用现有的completeness作为两个指标的值
-            return evaluation.completeness, evaluation.completeness
+            # 只有一个评委或没有保存多个评委结果，计算通过率作为两个指标的值
+            passed_count = sum(1 for cp in evaluation.checkpoint_results if cp.passed)
+            pass_rate = (passed_count / total_checkpoints) * 100 if total_checkpoints > 0 else 0.0
+            return pass_rate, pass_rate
 
     @staticmethod
     def generate_summary_report(

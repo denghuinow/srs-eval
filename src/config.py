@@ -34,8 +34,6 @@ class EvalConfig(BaseModel):
     """评估配置"""
 
     default_runs: int = Field(default=3, description="默认运行次数（用于取平均）")
-    completeness_weight: float = Field(default=0.5, description="完整性权重")
-    accuracy_weight: float = Field(default=0.5, description="准确性权重")
 
 
 class Config(BaseModel):
@@ -101,8 +99,6 @@ def load_config() -> Config:
 
     eval_config = EvalConfig(
         default_runs=int(os.getenv("DEFAULT_RUNS", "3")),
-        completeness_weight=float(os.getenv("COMPLETENESS_WEIGHT", "0.5")),
-        accuracy_weight=float(os.getenv("ACCURACY_WEIGHT", "0.5")),
     )
 
     prompt_version = os.getenv("PROMPT_VERSION", "v1")
