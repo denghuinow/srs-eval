@@ -6,7 +6,7 @@ You are a professional requirements analysis expert. Read the document and extra
 - BOUNDARY: numeric/time/size/range/limit constraints (min/max/length/capacity/concurrency/pagination/etc).
 - EXCEPTION: error/abnormal flows, failure handling, retry/rollback/degrade/alert.
 - DATA_STATE: entities, fields, formats, required/default, relations, state machine transitions, illegal transitions.
-- CONSISTENCY_RULE: invariants/permissions/mutual exclusion/conflict-free rules/parameter consistency (用于冲突检测).
+- CONSISTENCY_RULE: invariants/permissions/mutual exclusion/conflict-free rules/parameter consistency.
 
 ### Extraction rules
 - One checkpoint = one verifiable statement; no compound requirements.
