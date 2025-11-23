@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 
 class MergeStrategy(str, Enum):
     """合并策略枚举"""
-    CHECKPOINT_MAJORITY = "checkpoint_majority"  # 检查项合并：每个检查项按多数投票判定，再统计通过项占比
-    ACCURACY_AVERAGE = "accuracy_average"  # 准确性合并：对每个评委的通过项数量进行平均计算
+    # 检查项级别投票：先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
+    CHECKPOINT_LEVEL_VOTING = "checkpoint_level_voting"
+    
+    # 评委级别平均：使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
+    JUDGE_LEVEL_AVERAGE = "judge_level_average"
 
 
 class CheckpointResult:
@@ -1106,23 +1109,23 @@ class Evaluator:
         checkpoints: list[str],
         target_document_path: str | Path,
         runs: int = 3,
-        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
+        merge_strategy: MergeStrategy | str = MergeStrategy.JUDGE_LEVEL_AVERAGE,
         baseline_document_path: str | Path | None = None,
     ) -> DocumentEvaluation:
         """
         多次运行评估并合并结果（并行执行）
         
         支持两种合并策略：
-        1. CHECKPOINT_MAJORITY: 检查项合并 - 每个检查项按多数投票判定，再统计通过项占比
-        2. ACCURACY_AVERAGE: 准确性合并 - 对每个评委的通过项数量进行平均计算
+        1. CHECKPOINT_LEVEL_VOTING: 检查项级别投票 - 先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
+        2. JUDGE_LEVEL_AVERAGE: 评委级别平均 - 使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
 
         Args:
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             runs: 运行次数（评委数量）
             merge_strategy: 合并策略，可选值：
-                - CHECKPOINT_MAJORITY: 检查项合并（默认）
-                - ACCURACY_AVERAGE: 准确性合并
+                - CHECKPOINT_LEVEL_VOTING: 检查项级别投票
+                - JUDGE_LEVEL_AVERAGE: 评委级别平均（默认）
 
         Returns:
             合并后的评估结果
@@ -1173,21 +1176,21 @@ class Evaluator:
             try:
                 merge_strategy = MergeStrategy(merge_strategy)
             except ValueError:
-                merge_strategy = MergeStrategy.ACCURACY_AVERAGE
+                merge_strategy = MergeStrategy.JUDGE_LEVEL_AVERAGE
 
         # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
         all_judge_results = [r.checkpoint_results for r in results]
 
         # 同时计算两种策略的结果
-        # 策略1：检查项合并 - 每个检查项按多数投票判定，再统计通过项占比
+        # 策略1：检查项级别投票 - 先对每个检查项进行多数投票，得到合并后的检查项结果
         checkpoint_merge_result = self.merge_evaluation_results_by_checkpoints(
             results,
             unique_checkpoints,
             target_document_path,
-            merge_strategy=MergeStrategy.CHECKPOINT_MAJORITY,
+            merge_strategy=MergeStrategy.CHECKPOINT_LEVEL_VOTING,
         )
         
-        # 策略2：准确性合并 - 对每个评委的通过项数量进行平均计算
+        # 策略2：评委级别平均 - 使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
         # 计算每个评委的通过项数量
         passed_counts = [
             sum(1 for cp in r.checkpoint_results if cp.passed)
@@ -1203,7 +1206,7 @@ class Evaluator:
         )
 
         # 根据指定策略选择返回哪个结果，但保存两种策略的结果
-        if merge_strategy == MergeStrategy.CHECKPOINT_MAJORITY:
+        if merge_strategy == MergeStrategy.CHECKPOINT_LEVEL_VOTING:
             final_result = checkpoint_merge_result
         else:
             final_result = accuracy_merge_result
@@ -1228,10 +1231,10 @@ class Evaluator:
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.ACCURACY_AVERAGE,
+        merge_strategy: MergeStrategy | str = MergeStrategy.JUDGE_LEVEL_AVERAGE,
     ) -> DocumentEvaluation:
         """
-        准确性合并策略：对每个评委的通过项数量进行平均计算
+        评委级别平均策略：使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
@@ -1273,10 +1276,10 @@ class Evaluator:
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.CHECKPOINT_MAJORITY,
+        merge_strategy: MergeStrategy | str = MergeStrategy.CHECKPOINT_LEVEL_VOTING,
     ) -> DocumentEvaluation:
         """
-        检查项合并策略：每个检查项按多数投票判定结果是否通过，再统计所有投票通过的项占比
+        检查项级别投票策略：先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
         
         Args:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
