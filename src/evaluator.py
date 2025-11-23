@@ -17,6 +17,7 @@ from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
+from src.utils.checkpoint_utils import split_checkpoint_category
 from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
@@ -32,8 +33,19 @@ class MergeStrategy(str, Enum):
 class CheckpointResult:
     """检查项结果"""
 
-    def __init__(self, checkpoint: str, passed: bool, pass_rate: float | None = None):
+    def __init__(
+        self,
+        checkpoint: str,
+        passed: bool,
+        pass_rate: float | None = None,
+        category: str | None = None,
+        raw_checkpoint: str | None = None,
+    ):
+        # 去除类别前缀的正文
         self.checkpoint = checkpoint
+        # 原始检查点（保留类别前缀，用于展示）
+        self.raw_checkpoint = raw_checkpoint or checkpoint
+        self.category = category
         self.passed = passed
         # pass_rate: 通过率 (0.0-1.0)，用于加权平均计算
         # 如果未提供，则基于passed计算：passed=True时为1.0，False时为0.0
@@ -41,6 +53,13 @@ class CheckpointResult:
             self.pass_rate = pass_rate
         else:
             self.pass_rate = 1.0 if passed else 0.0
+
+    @property
+    def display_checkpoint(self) -> str:
+        """带类别前缀的展示文本"""
+        if self.category:
+            return f"[{self.category}] {self.checkpoint}"
+        return self.checkpoint
 
 
 
@@ -94,6 +113,17 @@ class Evaluator:
             timeout=self.config.openai.timeout,
         )
         self.parser = DocumentParser()
+
+    @staticmethod
+    def _deduplicate_checkpoints(checkpoints: list[str]) -> list[str]:
+        """去重检查项，保持顺序"""
+        seen = set()
+        unique = []
+        for cp in checkpoints:
+            if cp not in seen:
+                seen.add(cp)
+                unique.append(cp)
+        return unique
 
     @staticmethod
     def _extract_text_from_markdown(text: str) -> str:
@@ -341,8 +371,14 @@ class Evaluator:
         checkpoint_results = []
         for index, checkpoint in enumerate(checkpoints):
             passed = index_to_result.get(index, False)
+            category, content = split_checkpoint_category(checkpoint)
             checkpoint_results.append(
-                CheckpointResult(checkpoint=checkpoint, passed=passed)
+                CheckpointResult(
+                    checkpoint=content,
+                    passed=passed,
+                    category=category,
+                    raw_checkpoint=checkpoint,
+                )
             )
 
         return checkpoint_results
@@ -846,15 +882,12 @@ class Evaluator:
 
         # 去除检查项中的重复项（保持顺序）
         original_count = len(checkpoints)
-        seen = set()
-        unique_checkpoints = []
-        for checkpoint in checkpoints:
-            if checkpoint not in seen:
-                seen.add(checkpoint)
-                unique_checkpoints.append(checkpoint)
-        
+        unique_checkpoints = self._deduplicate_checkpoints(checkpoints)
         if original_count != len(unique_checkpoints):
-            logger.info(f"去重前检查项数量: {original_count}, 去重后: {len(unique_checkpoints)} (已去除 {original_count - len(unique_checkpoints)} 个重复项)")
+            logger.info(
+                f"去重前检查项数量: {original_count}, 去重后: {len(unique_checkpoints)} "
+                f"(已去除 {original_count - len(unique_checkpoints)} 个重复项)"
+            )
         
         # 准备检查项TSV表格
         checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints)
@@ -1097,13 +1130,22 @@ class Evaluator:
         # 记录开始时间
         start_time = time.time()
         evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 统一去重，保证所有评委的检查项索引一致，避免输出表格出现问号
+        original_count = len(checkpoints)
+        unique_checkpoints = self._deduplicate_checkpoints(checkpoints)
+        if original_count != len(unique_checkpoints):
+            logger.info(
+                f"评估前去重检查项：由 {original_count} 条降至 {len(unique_checkpoints)} 条 "
+                f"(移除 {original_count - len(unique_checkpoints)} 个重复项)"
+            )
         
         results = []
         
         # 并行执行多次评估
         with ThreadPoolExecutor(max_workers=runs) as executor:
             futures = {
-                executor.submit(self.evaluate_single_run, checkpoints, target_document_path): i
+                executor.submit(self.evaluate_single_run, unique_checkpoints, target_document_path): i
                 for i in range(runs)
             }
             
@@ -1139,7 +1181,10 @@ class Evaluator:
         # 同时计算两种策略的结果
         # 策略1：检查项合并 - 每个检查项按多数投票判定，再统计通过项占比
         checkpoint_merge_result = self.merge_evaluation_results_by_checkpoints(
-            results, checkpoints, target_document_path, merge_strategy=MergeStrategy.CHECKPOINT_MAJORITY
+            results,
+            unique_checkpoints,
+            target_document_path,
+            merge_strategy=MergeStrategy.CHECKPOINT_MAJORITY,
         )
         
         # 策略2：准确性合并 - 对每个评委的通过项数量进行平均计算
@@ -1152,7 +1197,7 @@ class Evaluator:
         first_result = results[0]
         accuracy_merge_result = DocumentEvaluation(
             target_document=str(target_document_path),
-            checkpoints=checkpoints,
+            checkpoints=unique_checkpoints,
             checkpoint_results=first_result.checkpoint_results,
             all_judge_results=all_judge_results,
         )
@@ -1205,6 +1250,8 @@ class Evaluator:
         if runs == 1:
             return raw_results[0]
 
+        checkpoints = self._deduplicate_checkpoints(checkpoints)
+
         # 使用第一个评委的详细评估结果（checkpoint_results字段）
         first_result = raw_results[0]
 
@@ -1248,6 +1295,8 @@ class Evaluator:
         if runs == 1:
             return raw_results[0]
 
+        checkpoints = self._deduplicate_checkpoints(checkpoints)
+
         # 合并评估结果（基于检查项结果）- 使用多数投票
         checkpoint_votes = {}  # checkpoint_index -> {passed_count, total_count}
         for result in raw_results:
@@ -1275,9 +1324,16 @@ class Evaluator:
             # 多数投票：超过50%认为通过则通过
             passed = votes["passed_count"] > (runs / 2)
             pass_rate = votes["passed_count"] / runs if runs > 0 else 0.0
+            category, content = split_checkpoint_category(checkpoint)
             
             merged_checkpoint_results.append(
-                CheckpointResult(checkpoint=checkpoint, passed=passed, pass_rate=pass_rate)
+                CheckpointResult(
+                    checkpoint=content,
+                    passed=passed,
+                    pass_rate=pass_rate,
+                    category=category,
+                    raw_checkpoint=checkpoint,
+                )
             )
         
         # 创建最终结果对象
@@ -1290,4 +1346,3 @@ class Evaluator:
         )
         
         return final_result
-

@@ -1,6 +1,7 @@
 """要点提取模块"""
 
 import copy
+import csv
 import hashlib
 import json
 import logging
@@ -13,6 +14,7 @@ from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
+from src.utils.checkpoint_utils import format_checkpoint, normalize_category, split_checkpoint_category
 from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
@@ -21,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 class PointExtractor:
     """从基准文档提取结构化要点清单"""
+
+    CACHE_VERSION = "v2"
 
     def __init__(self, config: Config | None = None, prompt_version: str | None = None):
         """
@@ -172,6 +176,7 @@ class PointExtractor:
             "document_path": str(Path(document_path).absolute()),
             "content_hash": content_hash,
             "checkpoints": checkpoints,
+            "version": self.CACHE_VERSION,
         }
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
@@ -200,10 +205,10 @@ class PointExtractor:
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     cache_data = json.load(f)
-                
-                # 验证content_hash是否匹配
+                # 验证版本和 content_hash 是否匹配
+                cache_version = cache_data.get("version")
                 cached_hash = cache_data.get("content_hash", "")
-                if cached_hash == content_hash:
+                if cache_version == self.CACHE_VERSION and cached_hash == content_hash:
                     # 检查checkpoints数组是否存在且非空
                     checkpoints = cache_data.get("checkpoints", [])
                     if checkpoints:
@@ -240,9 +245,10 @@ class PointExtractor:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     cache_data = json.load(f)
                 
-                # 验证content_hash是否匹配
+                # 验证版本和 content_hash 是否匹配
+                cache_version = cache_data.get("version")
                 cached_hash = cache_data.get("content_hash", "")
-                if cached_hash == content_hash:
+                if cache_version == self.CACHE_VERSION and cached_hash == content_hash:
                     # 读取checkpoints数组
                     checkpoints = cache_data.get("checkpoints", [])
                     if checkpoints:
@@ -650,21 +656,35 @@ class PointExtractor:
         logger.debug(f"{log_prefix}{'=' * 80}")
 
         try:
-            # 按行解析检查项
-            checkpoints = []
-            lines = cleaned_text.split('\n')
-            
-            for line in lines:
-                line = line.strip()
-                # 跳过空行
-                if not line:
-                    continue
-                # 跳过明显的编号或标记（如 "1. ", "- ", "* " 等）
-                line = self._remove_numbering(line)
-                # 跳过太短的行（可能是格式标记）
-                if len(line) < 3:
-                    continue
-                checkpoints.append(line)
+            checkpoints: list[str] = []
+            lines = cleaned_text.split("\n")
+
+            # 优先尝试解析 TSV 格式（推荐输出：Type\tCheckpoint）
+            if lines and "\t" in lines[0] and "type" in lines[0].lower():
+                reader = csv.DictReader(lines, delimiter="\t")
+                for row in reader:
+                    raw_category = row.get("Type") or row.get("类型") or row.get("Category")
+                    raw_checkpoint = row.get("Checkpoint") or row.get("检查点") or row.get("内容")
+                    if not raw_checkpoint:
+                        continue
+                    category = normalize_category(raw_category or "")
+                    # 如果 checkpoint 已包含前缀则拆分，优先使用显式 Type 列
+                    derived_category, derived_content = split_checkpoint_category(raw_checkpoint)
+                    if not raw_category and derived_category:
+                        category = derived_category or category
+                    raw_checkpoint = derived_content or raw_checkpoint
+                    checkpoints.append(format_checkpoint(category, raw_checkpoint))
+            else:
+                # 逐行兜底解析
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    line = self._remove_numbering(line)
+                    if len(line) < 3:
+                        continue
+                    category, content = split_checkpoint_category(line)
+                    checkpoints.append(format_checkpoint(category, content))
             
             if not checkpoints:
                 logger.error(f"{log_prefix}未提取到任何检查项")

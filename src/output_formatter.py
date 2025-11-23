@@ -26,6 +26,9 @@ class OutputFormatter:
         checkpoint_results_data = [
             {
                 "checkpoint": cp.checkpoint,
+                "display_checkpoint": cp.display_checkpoint,
+                "raw_checkpoint": cp.raw_checkpoint,
+                "category": cp.category,
                 "passed": cp.passed,
             }
             for cp in evaluation.checkpoint_results
@@ -33,12 +36,14 @@ class OutputFormatter:
 
         # 计算投票通过和平均通过分数
         voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
+        category_scores = OutputFormatter._aggregate_category_scores(evaluation)
         
         return {
             "target_document": evaluation.target_document,
             "scores": {
                 "voting_score": round(voting_score, 2),
                 "average_score": round(average_score, 2),
+                "categories": category_scores,
             },
             "checkpoints": evaluation.checkpoints,
             "checkpoint_results": checkpoint_results_data,
@@ -193,6 +198,35 @@ class OutputFormatter:
             lines.append(f"| 平均通过 | {passed_count} | {average_score:.2f} |")
             lines.append("")
 
+        # 维度得分
+        category_stats = OutputFormatter._aggregate_category_scores(evaluation)
+        category_labels = {
+            "FUNCTIONAL": "功能覆盖 / 行为规则",
+            "BUSINESS_FLOW": "业务流程完整性",
+            "BOUNDARY": "边界条件完整性",
+            "EXCEPTION": "异常处理覆盖度",
+            "DATA_STATE": "数据与状态完整性",
+            "CONSISTENCY_RULE": "一致性 / 冲突检测",
+        }
+        lines.append("## 维度得分\n")
+        lines.append("| 维度 | 检查项数 | 通过数 | 得分(%) |")
+        lines.append("|:-----|:-------:|:------:|:-------:|")
+        for cat, label in category_labels.items():
+            data = category_stats.get(cat, {"total": 0, "passed": 0, "score": 0.0})
+            lines.append(
+                f"| {label} | {data['total']} | {data['passed']} | {data['score']:.2f} |"
+            )
+
+        extra_categories = [
+            cat for cat in category_stats.keys() if cat not in category_labels
+        ]
+        for cat in sorted(extra_categories):
+            data = category_stats[cat]
+            lines.append(
+                f"| {cat} | {data['total']} | {data['passed']} | {data['score']:.2f} |"
+            )
+        lines.append("")
+
         # 检查项详细结果
         lines.append("## 检查项详细结果\n")
         
@@ -213,7 +247,12 @@ class OutputFormatter:
             
             # 对每个检查项，显示每个评委的结果和多数投票
             for index, checkpoint in enumerate(evaluation.checkpoints):
-                row = f"| {index} | {checkpoint} |"
+                display_checkpoint = (
+                    evaluation.checkpoint_results[index].display_checkpoint
+                    if index < len(evaluation.checkpoint_results)
+                    else checkpoint
+                )
+                row = f"| {index} | {display_checkpoint} |"
                 
                 # 收集每个评委的判断
                 judge_votes = []
@@ -241,7 +280,7 @@ class OutputFormatter:
             lines.append("|------|--------|------|")
             for index, cp_result in enumerate(evaluation.checkpoint_results):
                 status_str = "✓ 通过" if cp_result.passed else "✗ 未通过"
-                lines.append(f"| {index} | {cp_result.checkpoint} | {status_str} |")
+                lines.append(f"| {index} | {cp_result.display_checkpoint} | {status_str} |")
         
         lines.append("")
 
@@ -322,6 +361,36 @@ class OutputFormatter:
             passed_count = sum(1 for cp in evaluation.checkpoint_results if cp.passed)
             pass_rate = (passed_count / total_checkpoints) * 100 if total_checkpoints > 0 else 0.0
             return pass_rate, pass_rate
+
+    @staticmethod
+    def _aggregate_category_scores(evaluation: DocumentEvaluation) -> dict[str, dict[str, float | int]]:
+        """按类别聚合通过率"""
+        tracked_categories = [
+            "FUNCTIONAL",
+            "BUSINESS_FLOW",
+            "BOUNDARY",
+            "EXCEPTION",
+            "DATA_STATE",
+            "CONSISTENCY_RULE",
+        ]
+        stats: dict[str, dict[str, float | int]] = {
+            cat: {"total": 0, "passed": 0, "score": 0.0} for cat in tracked_categories
+        }
+
+        for cp in evaluation.checkpoint_results:
+            category = cp.category or "FUNCTIONAL"
+            if category not in stats:
+                stats[category] = {"total": 0, "passed": 0, "score": 0.0}
+            stats[category]["total"] += 1
+            if cp.passed:
+                stats[category]["passed"] += 1
+
+        for cat, data in stats.items():
+            total = data["total"]
+            passed = data["passed"]
+            data["score"] = round((passed / total) * 100, 2) if total else 0.0
+
+        return stats
 
     @staticmethod
     def generate_summary_report(
@@ -536,4 +605,3 @@ class OutputFormatter:
         )
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
-
