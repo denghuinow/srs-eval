@@ -611,11 +611,10 @@ def main():
                     if use_matching_mode and evaluation.baseline_document:
                         baseline_name = Path(evaluation.baseline_document).name
                         baseline_info = f" (基准: {baseline_name})"
-                    voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
+                    weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
                     logger.info(
                         f"[{completed}/{len(target_paths)}] ✓ {target_path.name}{baseline_info} - "
-                        f"投票通过: {voting_score:.2f}, "
-                        f"平均通过: {average_score:.2f}"
+                        f"加权得分: {weighted_score:.2f}"
                     )
         logger.info("")
     else:
@@ -670,12 +669,8 @@ def main():
                     evaluation.evaluation_duration = time.time() - start_time
 
                 evaluations.append(evaluation)
-                # 计算投票通过和平均通过分数
-                voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
-                logger.info(
-                    f"✓ 评估完成 - 投票通过: {voting_score:.2f}, "
-                    f"平均通过: {average_score:.2f}"
-                )
+                weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+                logger.info(f"✓ 评估完成 - 加权得分: {weighted_score:.2f}")
                 logger.info("")
             except Exception as e:
                 logger.error(f"评估失败: {e}")
@@ -746,35 +741,22 @@ def main():
     logger.info("-" * 60)
     for evaluation in evaluations:
         doc_name = Path(evaluation.target_document).name
-        voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
-        logger.info(
-            f"{doc_name}: "
-            f"投票通过={voting_score:.2f}, "
-            f"平均通过={average_score:.2f}"
-        )
+        weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+        logger.info(f"{doc_name}: 加权得分={weighted_score:.2f}")
     
     # 如果有多个评估结果，打印聚合统计
     if len(evaluations) > 1:
         logger.info("")
         logger.info("聚合统计:")
         logger.info("-" * 60)
-        # 计算投票通过和平均通过分数
-        voting_scores = []
-        average_scores = []
-        for evaluation in evaluations:
-            voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
-            voting_scores.append(voting_score)
-            average_scores.append(average_score)
-        
+        weighted_scores = [
+            OutputFormatter._calculate_weighted_score(evaluation)
+            for evaluation in evaluations
+        ]
         logger.info(
-            f"投票通过 - 平均: {statistics.mean(voting_scores):.2f}, "
-            f"中位数: {statistics.median(voting_scores):.2f}, "
-            f"范围: [{min(voting_scores):.2f}, {max(voting_scores):.2f}]"
-        )
-        logger.info(
-            f"平均通过 - 平均: {statistics.mean(average_scores):.2f}, "
-            f"中位数: {statistics.median(average_scores):.2f}, "
-            f"范围: [{min(average_scores):.2f}, {max(average_scores):.2f}]"
+            f"加权得分 - 平均: {statistics.mean(weighted_scores):.2f}, "
+            f"中位数: {statistics.median(weighted_scores):.2f}, "
+            f"范围: [{min(weighted_scores):.2f}, {max(weighted_scores):.2f}]"
         )
 
 
