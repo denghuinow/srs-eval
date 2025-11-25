@@ -228,6 +228,17 @@ def main():
         default=None,
         help="提示词版本（默认：从环境变量PROMPT_VERSION或配置中读取，默认值为v1）",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="跳过已存在的评估结果（如果输出文件已存在，则加载已有结果而不是重新评估）",
+    )
+    parser.add_argument(
+        "--force-re-eval",
+        type=str,
+        nargs="+",
+        help="强制重新评估指定的文档（即使已存在评估结果，也会重新评估）。可以指定文档名称（不含扩展名）或完整路径",
+    )
 
     args = parser.parse_args()
 
@@ -524,21 +535,95 @@ def main():
             logger.info(f"ℹ 多次提取模式：将执行 {args.extract_runs} 次提取，选择检查项数量最多的结果")
         logger.info("")
 
+    # 输出目录（提前创建，用于检查已存在的文件）
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    formatter = OutputFormatter()
+
+    # 如果使用 --skip-existing，检查并加载已存在的评估结果
+    evaluations = []
+    if args.skip_existing:
+        logger.info("检查已存在的评估结果...")
+        logger.info("-" * 60)
+        
+        existing_evaluations = []
+        new_target_paths = []
+        
+        # 准备强制重新评估的文档名称集合（支持多种格式）
+        force_re_eval_set = set()
+        if args.force_re_eval:
+            for item in args.force_re_eval:
+                # 支持文档名称（不含扩展名）或完整路径
+                item_path = Path(item)
+                if item_path.is_absolute() or item_path.exists():
+                    # 是完整路径
+                    force_re_eval_set.add(item_path.stem)
+                else:
+                    # 是文档名称（去掉扩展名以匹配 doc_name 格式）
+                    force_re_eval_set.add(item_path.stem)
+        
+        for target_path in target_paths:
+            doc_name = Path(target_path).stem
+            
+            # 检查是否需要强制重新评估
+            if args.force_re_eval and doc_name in force_re_eval_set:
+                logger.info(f"🔄 {doc_name} - 强制重新评估（忽略已存在的结果）")
+                new_target_paths.append(target_path)
+                continue
+            
+            json_path = output_dir / f"{doc_name}_evaluation.json"
+            md_path = output_dir / f"{doc_name}_evaluation.md"
+            
+            # 优先检查 JSON 文件（包含完整评估数据）
+            if json_path.exists():
+                # 尝试加载已存在的评估结果
+                existing_eval = formatter.load_json(json_path)
+                if existing_eval:
+                    existing_evaluations.append(existing_eval)
+                    logger.info(f"⊘ {doc_name} - 已存在（JSON），跳过评估")
+                else:
+                    # 加载失败，需要重新评估
+                    new_target_paths.append(target_path)
+            # 如果 JSON 不存在，检查 Markdown 文件是否存在（作为已存在的标志）
+            elif md_path.exists():
+                # Markdown 文件存在但 JSON 不存在，尝试从 Markdown 解析评估结果
+                existing_eval = formatter.load_from_markdown(md_path)
+                if existing_eval:
+                    existing_evaluations.append(existing_eval)
+                    # 保存为 JSON 文件，以便下次直接加载
+                    formatter.save_json(existing_eval, json_path)
+                    logger.info(f"⊘ {doc_name} - 已存在（Markdown），已从Markdown解析并保存为JSON，跳过评估")
+                else:
+                    # 解析失败，需要重新评估
+                    logger.warning(f"⚠ {doc_name} - Markdown存在但解析失败，将重新评估")
+                    new_target_paths.append(target_path)
+            else:
+                # 文件不存在，需要评估
+                new_target_paths.append(target_path)
+        
+        if existing_evaluations:
+            logger.info(f"已跳过 {len(existing_evaluations)} 个已存在的评估结果（已加载）")
+        if new_target_paths:
+            logger.info(f"需要评估 {len(new_target_paths)} 个新文档")
+        logger.info("")
+        
+        # 将已存在的评估结果添加到 evaluations 列表
+        evaluations.extend(existing_evaluations)
+        
+        # 更新 target_paths 为需要评估的文档
+        target_paths = new_target_paths
+
     # 评估文档（支持并行执行）
     evaluator = Evaluator(config, prompt_version=config.prompt_version)
-    evaluations = []
 
-    # 确定是否并行执行
-    parallel_eval = len(target_paths) > 1 or judges > 1
+    # 确定是否并行执行（仅根据文档数量，judges 现在是串行的）
+    parallel_eval = len(target_paths) > 1
     max_workers = args.max_workers
     
-    if parallel_eval:
+    if parallel_eval and target_paths:
         if max_workers is None:
-            # 自动计算：如果是批量评估，每个文档并行；如果是多次运行，并行运行
-            if len(target_paths) > 1:
-                max_workers = min(len(target_paths), 10)  # 最多10个并行
-            else:
-                max_workers = judges
+            # 自动计算：如果是批量评估，每个文档并行
+            max_workers = min(len(target_paths), 10)  # 最多10个并行
         logger.info(f"ℹ 并行执行模式：最大工作线程数 = {max_workers}")
         logger.info("")
 
@@ -678,30 +763,34 @@ def main():
                 continue
 
     if not evaluations:
-        logger.error("没有成功评估任何文档")
+        logger.error("没有成功评估任何文档，也没有已存在的评估结果")
         sys.exit(1)
 
-    # 输出结果
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # 保存新评估的结果
+    if target_paths:
+        logger.info("正在保存评估结果...")
+        logger.info("-" * 60)
+        
+        # 只保存新评估的结果（target_paths 中的文档）
+        new_evaluations = [e for e in evaluations if Path(e.target_document) in target_paths]
+        for evaluation in new_evaluations:
+            doc_name = Path(evaluation.target_document).stem
 
-    formatter = OutputFormatter()
-
-    logger.info("正在保存评估结果...")
-    logger.info("-" * 60)
-
-    for i, evaluation in enumerate(evaluations):
-        doc_name = Path(evaluation.target_document).stem
-
-        if args.output in ["json", "all"]:
+            # 总是保存 JSON 文件（用于 --skip-existing 功能）
             json_path = output_dir / f"{doc_name}_evaluation.json"
             formatter.save_json(evaluation, json_path)
             logger.info(f"✓ JSON: {json_path}")
 
-        if args.output in ["markdown", "all"]:
-            md_path = output_dir / f"{doc_name}_evaluation.md"
-            formatter.save_markdown(evaluation, md_path)
-            logger.info(f"✓ Markdown: {md_path}")
+            if args.output in ["markdown", "all"]:
+                md_path = output_dir / f"{doc_name}_evaluation.md"
+                formatter.save_markdown(evaluation, md_path)
+                logger.info(f"✓ Markdown: {md_path}")
+            
+            # 始终保存 TSV 文件（包含所有评委的详细结果）
+            tsv_path = output_dir / f"{doc_name}_evaluation.tsv"
+            formatter.save_tsv(evaluation, tsv_path)
+            logger.info(f"✓ TSV: {tsv_path}")
+        logger.info("")
 
     if args.output in ["csv", "all"]:
         csv_path = output_dir / "evaluations_summary.csv"

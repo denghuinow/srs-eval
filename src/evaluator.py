@@ -7,9 +7,7 @@ import json
 import logging
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +20,6 @@ from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
 logger = logging.getLogger(__name__)
-
-
-class MergeStrategy(str, Enum):
-    """合并策略枚举"""
-    # 检查项级别投票：先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
-    CHECKPOINT_LEVEL_VOTING = "checkpoint_level_voting"
-    
-    # 评委级别平均：使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
-    JUDGE_LEVEL_AVERAGE = "judge_level_average"
 
 
 class CheckpointResult:
@@ -76,8 +65,6 @@ class DocumentEvaluation:
         checkpoints: list[str],
         checkpoint_results: list[CheckpointResult],
         all_judge_results: list[list[CheckpointResult]] | None = None,
-        checkpoint_merge_result: "DocumentEvaluation | None" = None,
-        accuracy_merge_result: "DocumentEvaluation | None" = None,
         model_name: str | None = None,
         baseline_document: str | None = None,
     ):
@@ -87,9 +74,6 @@ class DocumentEvaluation:
         # 存储所有评委的检查项结果，用于显示每个评委的判断
         # all_judge_results[i] 表示第 i 个评委对所有检查项的评估结果
         self.all_judge_results = all_judge_results
-        # 存储两种策略的合并结果
-        self.checkpoint_merge_result = checkpoint_merge_result  # 检查项合并策略的结果
-        self.accuracy_merge_result = accuracy_merge_result  # 准确性合并策略的结果
         # 评估元信息
         self.model_name = model_name  # 使用的模型名称
         self.baseline_document = baseline_document  # 基准文档路径
@@ -1109,26 +1093,21 @@ class Evaluator:
         checkpoints: list[str],
         target_document_path: str | Path,
         runs: int = 3,
-        merge_strategy: MergeStrategy | str = MergeStrategy.JUDGE_LEVEL_AVERAGE,
         baseline_document_path: str | Path | None = None,
     ) -> DocumentEvaluation:
         """
-        多次运行评估并合并结果（并行执行）
+        多次运行评估并合并结果（串行执行）
         
-        支持两种合并策略：
-        1. CHECKPOINT_LEVEL_VOTING: 检查项级别投票 - 先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
-        2. JUDGE_LEVEL_AVERAGE: 评委级别平均 - 使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
+        使用检查项级别投票策略：对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分。
 
         Args:
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
             runs: 运行次数（评委数量）
-            merge_strategy: 合并策略，可选值：
-                - CHECKPOINT_LEVEL_VOTING: 检查项级别投票
-                - JUDGE_LEVEL_AVERAGE: 评委级别平均（默认）
+            baseline_document_path: 基准文档路径（可选）
 
         Returns:
-            合并后的评估结果
+            合并后的评估结果（基于多数投票）
         """
         # 记录开始时间
         start_time = time.time()
@@ -1145,24 +1124,16 @@ class Evaluator:
         
         results = []
         
-        # 并行执行多次评估
-        with ThreadPoolExecutor(max_workers=runs) as executor:
-            futures = {
-                executor.submit(self.evaluate_single_run, unique_checkpoints, target_document_path): i
-                for i in range(runs)
-            }
-            
-            completed = 0
-            for future in as_completed(futures):
-                completed += 1
-                try:
-                    result = future.result()
-                    results.append(result)
-                    logger.info(f"  [{completed}/{runs}] 评委评估完成")
-                except Exception as e:
-                    logger.error(f"  [{completed}/{runs}] 评委评估失败: {e}")
-                    logger.debug(f"评委评估失败详情:", exc_info=True)
-                    continue
+        # 串行执行多次评估
+        for i in range(runs):
+            try:
+                result = self.evaluate_single_run(unique_checkpoints, target_document_path)
+                results.append(result)
+                logger.info(f"  [{i+1}/{runs}] 评委评估完成")
+            except Exception as e:
+                logger.error(f"  [{i+1}/{runs}] 评委评估失败: {e}")
+                logger.debug(f"评委评估失败详情:", exc_info=True)
+                continue
 
         # 如果只有一个结果，直接返回
         if len(results) == 1:
@@ -1171,50 +1142,16 @@ class Evaluator:
         if not results:
             raise ValueError("没有成功的评估结果")
 
-        # 处理字符串类型的策略
-        if isinstance(merge_strategy, str):
-            try:
-                merge_strategy = MergeStrategy(merge_strategy)
-            except ValueError:
-                merge_strategy = MergeStrategy.JUDGE_LEVEL_AVERAGE
-
         # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
         all_judge_results = [r.checkpoint_results for r in results]
 
-        # 同时计算两种策略的结果
-        # 策略1：检查项级别投票 - 先对每个检查项进行多数投票，得到合并后的检查项结果
-        checkpoint_merge_result = self.merge_evaluation_results_by_checkpoints(
+        # 使用检查项级别投票策略：对每个检查项进行多数投票，得到合并后的检查项结果
+        final_result = self.merge_evaluation_results_by_checkpoints(
             results,
             unique_checkpoints,
             target_document_path,
-            merge_strategy=MergeStrategy.CHECKPOINT_LEVEL_VOTING,
-        )
-        
-        # 策略2：评委级别平均 - 使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
-        # 计算每个评委的通过项数量
-        passed_counts = [
-            sum(1 for cp in r.checkpoint_results if cp.passed)
-            for r in results
-        ]
-        
-        first_result = results[0]
-        accuracy_merge_result = DocumentEvaluation(
-            target_document=str(target_document_path),
-            checkpoints=unique_checkpoints,
-            checkpoint_results=first_result.checkpoint_results,
-            all_judge_results=all_judge_results,
         )
 
-        # 根据指定策略选择返回哪个结果，但保存两种策略的结果
-        if merge_strategy == MergeStrategy.CHECKPOINT_LEVEL_VOTING:
-            final_result = checkpoint_merge_result
-        else:
-            final_result = accuracy_merge_result
-        
-        # 在最终结果中保存两种策略的结果
-        final_result.checkpoint_merge_result = checkpoint_merge_result
-        final_result.accuracy_merge_result = accuracy_merge_result
-        
         # 保存评估元信息
         final_result.model_name = self.config.openai.model
         if baseline_document_path:
@@ -1226,57 +1163,11 @@ class Evaluator:
 
         return final_result
 
-    def merge_evaluation_results(
-        self,
-        raw_results: list[DocumentEvaluation],
-        checkpoints: list[str],
-        target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.JUDGE_LEVEL_AVERAGE,
-    ) -> DocumentEvaluation:
-        """
-        评委级别平均策略：使用第一个评委的检查项结果，但在计算整体通过率时使用所有评委的平均值
-        
-        Args:
-            raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
-            checkpoints: 检查项清单
-            target_document_path: 待评估文档路径
-            merge_strategy: 合并策略（仅用于兼容性，实际使用平均值）
-        
-        Returns:
-            合并后的评估结果
-        """
-        runs = len(raw_results)
-        if runs == 0:
-            raise ValueError("原始结果列表不能为空")
-        
-        # 如果只有一个结果，直接返回
-        if runs == 1:
-            return raw_results[0]
-
-        checkpoints = self._deduplicate_checkpoints(checkpoints)
-
-        # 使用第一个评委的详细评估结果（checkpoint_results字段）
-        first_result = raw_results[0]
-
-        # 保存所有评委的检查项结果，用于在报告中显示每个评委的判断
-        all_judge_results = [r.checkpoint_results for r in raw_results]
-
-        # 创建最终结果对象
-        final_result = DocumentEvaluation(
-            target_document=str(target_document_path),
-            checkpoints=checkpoints,
-            checkpoint_results=first_result.checkpoint_results,
-            all_judge_results=all_judge_results,
-        )
-
-        return final_result
-
     def merge_evaluation_results_by_checkpoints(
         self,
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
-        merge_strategy: MergeStrategy | str = MergeStrategy.CHECKPOINT_LEVEL_VOTING,
     ) -> DocumentEvaluation:
         """
         检查项级别投票策略：先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
@@ -1285,10 +1176,9 @@ class Evaluator:
             raw_results: 原始评估结果列表（来自多次 evaluate_single_run）
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
-            merge_strategy: 合并策略（仅用于兼容性，实际使用多数投票）
         
         Returns:
-            合并后的评估结果
+            合并后的评估结果（基于多数投票）
         """
         runs = len(raw_results)
         if runs == 0:

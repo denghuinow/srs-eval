@@ -2,11 +2,12 @@
 
 import csv
 import json
+import logging
 import statistics
 from pathlib import Path
 from typing import Any
 
-from src.evaluator import DocumentEvaluation
+from src.evaluator import CheckpointResult, DocumentEvaluation
 
 
 class OutputFormatter:
@@ -30,16 +31,34 @@ class OutputFormatter:
                 "raw_checkpoint": cp.raw_checkpoint,
                 "category": cp.category,
                 "passed": cp.passed,
+                "pass_rate": getattr(cp, "pass_rate", None),
             }
             for cp in evaluation.checkpoint_results
         ]
+
+        # 保存所有评委的详细结果
+        all_judge_results_data = None
+        if evaluation.all_judge_results and len(evaluation.all_judge_results) > 1:
+            all_judge_results_data = []
+            for judge_idx, judge_results in enumerate(evaluation.all_judge_results):
+                judge_data = [
+                    {
+                        "checkpoint": cp.checkpoint,
+                        "display_checkpoint": cp.display_checkpoint,
+                        "raw_checkpoint": cp.raw_checkpoint,
+                        "category": cp.category,
+                        "passed": cp.passed,
+                    }
+                    for cp in judge_results
+                ]
+                all_judge_results_data.append(judge_data)
 
         # 计算投票通过和平均通过分数
         voting_score, average_score = OutputFormatter._calculate_voting_and_average_scores(evaluation)
         category_scores = OutputFormatter._aggregate_category_scores(evaluation)
         weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
         
-        return {
+        result = {
             "target_document": evaluation.target_document,
             "scores": {
                 "voting_score": round(voting_score, 2),
@@ -50,6 +69,23 @@ class OutputFormatter:
             "checkpoints": evaluation.checkpoints,
             "checkpoint_results": checkpoint_results_data,
         }
+        
+        # 如果有多个评委的结果，添加到 JSON 中
+        if all_judge_results_data:
+            result["all_judge_results"] = all_judge_results_data
+            result["num_judges"] = len(all_judge_results_data)
+        
+        # 添加元信息
+        if evaluation.model_name:
+            result["model_name"] = evaluation.model_name
+        if evaluation.baseline_document:
+            result["baseline_document"] = evaluation.baseline_document
+        if evaluation.evaluation_time:
+            result["evaluation_time"] = evaluation.evaluation_time
+        if evaluation.evaluation_duration:
+            result["evaluation_duration"] = evaluation.evaluation_duration
+        
+        return result
 
     @staticmethod
     def to_csv(
@@ -279,6 +315,214 @@ class OutputFormatter:
         return "\n".join(lines)
 
     @staticmethod
+    def load_json(output_path: str | Path) -> DocumentEvaluation | None:
+        """
+        从JSON文件加载评估结果
+
+        Args:
+            output_path: JSON文件路径
+
+        Returns:
+            评估结果对象，如果加载失败则返回None
+        """
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # 重建 CheckpointResult 列表
+            checkpoint_results = []
+            for cp_data in data.get("checkpoint_results", []):
+                cp_result = CheckpointResult(
+                    checkpoint=cp_data.get("checkpoint", ""),
+                    passed=cp_data.get("passed", False),
+                    category=cp_data.get("category"),
+                    raw_checkpoint=cp_data.get("raw_checkpoint"),
+                )
+                if "pass_rate" in cp_data:
+                    cp_result.pass_rate = cp_data["pass_rate"]
+                checkpoint_results.append(cp_result)
+            
+            # 重建所有评委的结果
+            all_judge_results = None
+            if "all_judge_results" in data and data["all_judge_results"]:
+                all_judge_results = []
+                for judge_data_list in data["all_judge_results"]:
+                    judge_results = []
+                    for cp_data in judge_data_list:
+                        cp_result = CheckpointResult(
+                            checkpoint=cp_data.get("checkpoint", ""),
+                            passed=cp_data.get("passed", False),
+                            category=cp_data.get("category"),
+                            raw_checkpoint=cp_data.get("raw_checkpoint"),
+                        )
+                        judge_results.append(cp_result)
+                    all_judge_results.append(judge_results)
+            
+            # 创建 DocumentEvaluation 对象
+            evaluation = DocumentEvaluation(
+                target_document=data.get("target_document", ""),
+                checkpoints=data.get("checkpoints", []),
+                checkpoint_results=checkpoint_results,
+                all_judge_results=all_judge_results,
+            )
+            
+            # 设置元信息
+            if "model_name" in data:
+                evaluation.model_name = data["model_name"]
+            if "baseline_document" in data:
+                evaluation.baseline_document = data["baseline_document"]
+            if "evaluation_time" in data:
+                evaluation.evaluation_time = data["evaluation_time"]
+            if "evaluation_duration" in data:
+                evaluation.evaluation_duration = data["evaluation_duration"]
+            
+            return evaluation
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"加载评估结果失败 {output_path}: {e}")
+            return None
+
+    @staticmethod
+    def load_from_markdown(md_path: str | Path) -> DocumentEvaluation | None:
+        """
+        从Markdown文件解析评估结果
+
+        Args:
+            md_path: Markdown文件路径
+
+        Returns:
+            评估结果对象，如果解析失败则返回None
+        """
+        import re
+        
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # 解析评估信息
+            target_doc_match = re.search(r'评估文档 \| (.+?) \|', content)
+            baseline_doc_match = re.search(r'基准文档 \| (.+?) \|', content)
+            model_match = re.search(r'评估模型 \| (.+?) \|', content)
+            eval_time_match = re.search(r'评估时间 \| (.+?) \|', content)
+            eval_duration_match = re.search(r'评估耗时 \| (.+?)秒', content)
+            
+            target_document = target_doc_match.group(1) if target_doc_match else ""
+            baseline_document = baseline_doc_match.group(1) if baseline_doc_match else None
+            model_name = model_match.group(1) if model_match else None
+            evaluation_time = eval_time_match.group(1) if eval_time_match else None
+            evaluation_duration = float(eval_duration_match.group(1)) if eval_duration_match else None
+            
+            # 解析检查项总数
+            total_checkpoints_match = re.search(r'检查项总数 \| (\d+) \|', content)
+            total_checkpoints = int(total_checkpoints_match.group(1)) if total_checkpoints_match else 0
+            
+            # 解析检查项详细结果表格
+            # 查找表格开始位置
+            table_start = content.find("## 检查项详细结果")
+            if table_start == -1:
+                return None
+            
+            table_content = content[table_start:]
+            
+            # 解析表格行（跳过表头）
+            checkpoint_results = []
+            checkpoints = []
+            
+            # 匹配表格行：| 索引 | 检查项 | 评委1 | ... | 多数投票 |
+            pattern = r'\|\s*(\d+)\s*\|\s*(.+?)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|\s*([^\|]+)\s*\|'
+            
+            # 更灵活的匹配：匹配所有列直到多数投票列
+            lines = table_content.split('\n')
+            in_table = False
+            num_judges = 0
+            
+            for line in lines:
+                line = line.strip()
+                if not line or not line.startswith('|'):
+                    continue
+                
+                # 检测表头，确定评委数量
+                if '多数投票' in line and '评委' in line:
+                    # 计算评委列数
+                    cols = [c.strip() for c in line.split('|') if c.strip()]
+                    num_judges = sum(1 for c in cols if '评委' in c)
+                    in_table = True
+                    continue
+                
+                if not in_table:
+                    continue
+                
+                # 跳过分隔行
+                if line.startswith('|:') or line.startswith('|-'):
+                    continue
+                
+                # 解析数据行
+                cols = [c.strip() for c in line.split('|') if c.strip()]
+                if len(cols) < 3:
+                    continue
+                
+                try:
+                    index = int(cols[0])
+                    checkpoint_text = cols[1]
+                    
+                    # 判断是否有多个评委列（检查表头是否有"多数投票"列）
+                    # 多数投票列总是在最后
+                    if len(cols) > 3 and ('多数投票' in line or '评委' in line):
+                        # 多评委情况，最后一个是多数投票结果
+                        majority_vote = cols[-1] if cols else ""
+                        passed = "通过" in majority_vote or "✓ 通过" in majority_vote
+                    else:
+                        # 单评委情况，第三列是状态
+                        status = cols[2] if len(cols) > 2 else ""
+                        passed = "通过" in status or "✓" in status
+                    
+                    # 提取类别和检查项文本
+                    category = None
+                    checkpoint = checkpoint_text
+                    if checkpoint_text.startswith('[') and ']' in checkpoint_text:
+                        category_match = re.match(r'\[([^\]]+)\]\s*(.+)', checkpoint_text)
+                        if category_match:
+                            category = category_match.group(1)
+                            checkpoint = category_match.group(2).strip()
+                    
+                    # 创建 CheckpointResult
+                    cp_result = CheckpointResult(
+                        checkpoint=checkpoint,
+                        passed=passed,
+                        category=category,
+                        raw_checkpoint=checkpoint_text,
+                    )
+                    checkpoint_results.append(cp_result)
+                    checkpoints.append(checkpoint_text)
+                    
+                except (ValueError, IndexError):
+                    continue
+            
+            if not checkpoint_results:
+                return None
+            
+            # 创建 DocumentEvaluation 对象
+            evaluation = DocumentEvaluation(
+                target_document=target_document,
+                checkpoints=checkpoints,
+                checkpoint_results=checkpoint_results,
+            )
+            
+            # 设置元信息
+            evaluation.model_name = model_name
+            evaluation.baseline_document = baseline_document
+            evaluation.evaluation_time = evaluation_time
+            evaluation.evaluation_duration = evaluation_duration
+            
+            return evaluation
+            
+        except Exception as e:
+            logger = logging.getLogger(__name__)
+            logger.warning(f"从Markdown解析评估结果失败 {md_path}: {e}")
+            logger.debug(f"解析失败详情:", exc_info=True)
+            return None
+
+    @staticmethod
     def save_json(
         evaluation: DocumentEvaluation, output_path: str | Path
     ) -> None:
@@ -305,6 +549,90 @@ class OutputFormatter:
             output_path: 输出路径
         """
         content = OutputFormatter.to_markdown(evaluation)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    @staticmethod
+    def to_tsv(evaluation: DocumentEvaluation) -> str:
+        """
+        转换为TSV格式（包含所有评委的详细结果）
+
+        Args:
+            evaluation: 评估结果
+
+        Returns:
+            TSV格式的字符串
+        """
+        import io
+        
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter='\t')
+        
+        # 表头
+        if evaluation.all_judge_results and len(evaluation.all_judge_results) > 1:
+            num_judges = len(evaluation.all_judge_results)
+            header = ["索引", "检查项", "类别"]
+            for i in range(num_judges):
+                header.append(f"评委{i+1}")
+            header.extend(["多数投票", "通过率"])
+            writer.writerow(header)
+            
+            # 数据行
+            for index, checkpoint in enumerate(evaluation.checkpoints):
+                cp_result = evaluation.checkpoint_results[index] if index < len(evaluation.checkpoint_results) else None
+                
+                row = [index, checkpoint, cp_result.category if cp_result else ""]
+                
+                # 每个评委的结果
+                for judge_idx in range(num_judges):
+                    if index < len(evaluation.all_judge_results[judge_idx]):
+                        judge_result = evaluation.all_judge_results[judge_idx][index]
+                        row.append("✓" if judge_result.passed else "✗")
+                    else:
+                        row.append("?")
+                
+                # 多数投票结果
+                majority_passed = cp_result.passed if cp_result else False
+                row.append("✓" if majority_passed else "✗")
+                
+                # 通过率
+                pass_rate = cp_result.pass_rate if cp_result and hasattr(cp_result, "pass_rate") else None
+                if pass_rate is not None:
+                    row.append(f"{pass_rate:.2%}")
+                else:
+                    row.append("")
+                
+                writer.writerow(row)
+        else:
+            # 单评委情况
+            header = ["索引", "检查项", "类别", "状态"]
+            writer.writerow(header)
+            
+            for index, checkpoint in enumerate(evaluation.checkpoints):
+                cp_result = evaluation.checkpoint_results[index] if index < len(evaluation.checkpoint_results) else None
+                status = "✓" if (cp_result and cp_result.passed) else "✗"
+                row = [
+                    index,
+                    checkpoint,
+                    cp_result.category if cp_result else "",
+                    status,
+                ]
+                writer.writerow(row)
+        
+        return output.getvalue()
+
+    @staticmethod
+    def save_tsv(
+        evaluation: DocumentEvaluation, output_path: str | Path
+    ) -> None:
+        """
+        保存为TSV文件（包含所有评委的详细结果）
+
+        Args:
+            evaluation: 评估结果
+            output_path: 输出路径
+        """
+        content = OutputFormatter.to_tsv(evaluation)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
