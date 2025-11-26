@@ -44,4 +44,4 @@ output
 # uv
 .uv/
 logs/
-test/
+test

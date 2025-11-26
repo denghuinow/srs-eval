@@ -1032,3 +1032,246 @@ class OutputFormatter:
         )
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
+    
+    @staticmethod
+    def generate_cross_stage_comparison_report(
+        stage_evaluations: dict[str, dict],
+        baseline_dir: str | Path | None = None,
+        output_dir: str | Path | None = None,
+    ) -> str:
+        """
+        生成跨阶段对比报告
+        
+        Args:
+            stage_evaluations: 字典，键为阶段名称，值为包含'evaluations'和'output_dir'的字典
+            baseline_dir: 基准文档目录（可选）
+            output_dir: 输出目录（可选）
+            
+        Returns:
+            Markdown格式的跨阶段对比报告
+        """
+        if not stage_evaluations:
+            return "# 跨阶段对比报告\n\n没有评估结果。\n"
+        
+        lines = []
+        lines.append("# 跨阶段对比报告\n")
+        lines.append("")
+        
+        # 评估信息
+        lines.append("## 评估信息\n")
+        lines.append("| 项目 | 内容 |")
+        lines.append("|------|------|")
+        
+        if baseline_dir:
+            baseline_dir_path = Path(baseline_dir)
+            lines.append(f"| 基准文档目录 | {baseline_dir_path.absolute()} |")
+        
+        if output_dir:
+            output_dir_path = Path(output_dir)
+            lines.append(f"| 输出目录 | {output_dir_path.absolute()} |")
+        
+        lines.append(f"| 阶段数量 | {len(stage_evaluations)} |")
+        
+        total_docs = sum(len(data["evaluations"]) for data in stage_evaluations.values())
+        lines.append(f"| 总评估文档数 | {total_docs} |")
+        lines.append("")
+        lines.append("")
+        
+        # 收集所有阶段的统计数据
+        stage_stats = {}
+        for stage_name, data in stage_evaluations.items():
+            evaluations = data["evaluations"]
+            if not evaluations:
+                continue
+            
+            # 计算加权得分
+            weighted_scores = [OutputFormatter._calculate_weighted_score(e) for e in evaluations]
+            avg_weighted = statistics.mean(weighted_scores) if weighted_scores else 0.0
+            
+            # 计算投票通过率和平均通过率
+            voting_and_avg_scores = [OutputFormatter._calculate_voting_and_average_scores(e) for e in evaluations]
+            vote_pass_rates = [score[0] for score in voting_and_avg_scores]
+            avg_pass_rates = [score[1] for score in voting_and_avg_scores]
+            
+            avg_vote_pass = statistics.mean(vote_pass_rates) if vote_pass_rates else 0.0
+            avg_avg_pass = statistics.mean(avg_pass_rates) if avg_pass_rates else 0.0
+            
+            # 计算各维度平均得分
+            category_scores_all = {}
+            for evaluation in evaluations:
+                cat_scores = OutputFormatter._aggregate_category_scores(evaluation)
+                for cat, stats in cat_scores.items():
+                    if cat not in category_scores_all:
+                        category_scores_all[cat] = []
+                    category_scores_all[cat].append(stats["score"])
+            
+            avg_category_scores = {
+                cat: statistics.mean(scores) if scores else 0.0
+                for cat, scores in category_scores_all.items()
+            }
+            
+            stage_stats[stage_name] = {
+                "avg_weighted_score": avg_weighted,
+                "avg_vote_pass_rate": avg_vote_pass,
+                "avg_avg_pass_rate": avg_avg_pass,
+                "category_scores": avg_category_scores,
+                "doc_count": len(evaluations),
+            }
+        
+        # 1. 总体得分对比
+        lines.append("## 1. 总体得分对比\n")
+        lines.append("| 阶段 | 文档数 | 平均加权得分 | 平均投票通过率 | 平均通过率 |")
+        lines.append("|------|--------|-------------|---------------|-----------|")
+        
+        # 按加权得分排序
+        sorted_stages = sorted(
+            stage_stats.items(),
+            key=lambda x: x[1]["avg_weighted_score"],
+            reverse=True
+        )
+        
+        for stage_name, stats in sorted_stages:
+            # 简化阶段名称显示
+            display_name = stage_name.replace("srs_document_", "")
+            lines.append(
+                f"| {display_name} | {stats['doc_count']} | "
+                f"{stats['avg_weighted_score']:.2f} | "
+                f"{stats['avg_vote_pass_rate']:.2f}% | "
+                f"{stats['avg_avg_pass_rate']:.2f}% |"
+            )
+        
+        lines.append("")
+        lines.append("")
+        
+        # 2. 维度得分对比
+        lines.append("## 2. 维度得分对比\n")
+        
+        # 获取所有维度
+        all_categories = set()
+        for stats in stage_stats.values():
+            all_categories.update(stats["category_scores"].keys())
+        
+        category_order = [
+            "FUNCTIONAL",
+            "BUSINESS_FLOW",
+            "BOUNDARY",
+            "EXCEPTION",
+            "DATA_STATE",
+            "CONSISTENCY_RULE",
+        ]
+        categories = [cat for cat in category_order if cat in all_categories]
+        categories.extend([cat for cat in sorted(all_categories) if cat not in category_order])
+        
+        # 表头
+        header = "| 阶段 | " + " | ".join(categories) + " |"
+        lines.append(header)
+        lines.append("|------|" + "|".join(["------" for _ in categories]) + "|")
+        
+        for stage_name, stats in sorted_stages:
+            display_name = stage_name.replace("srs_document_", "")
+            row = f"| {display_name} |"
+            for cat in categories:
+                score = stats["category_scores"].get(cat, 0.0)
+                row += f" {score:.2f}% |"
+            lines.append(row)
+        
+        lines.append("")
+        lines.append("")
+        
+        # 3. 阶段排名
+        lines.append("## 3. 阶段排名（按加权得分）\n")
+        lines.append("| 排名 | 阶段 | 平均加权得分 |")
+        lines.append("|------|------|-------------|")
+        
+        for rank, (stage_name, stats) in enumerate(sorted_stages, start=1):
+            display_name = stage_name.replace("srs_document_", "")
+            lines.append(
+                f"| {rank} | {display_name} | {stats['avg_weighted_score']:.2f} |"
+            )
+        
+        lines.append("")
+        lines.append("")
+        
+        # 4. 得分趋势分析
+        lines.append("## 4. 得分趋势分析\n")
+        lines.append("### 加权得分趋势\n")
+        lines.append("| 阶段 | 加权得分 | 趋势 |")
+        lines.append("|------|---------|------|")
+        
+        prev_score = None
+        for stage_name, stats in sorted_stages:
+            display_name = stage_name.replace("srs_document_", "")
+            score = stats["avg_weighted_score"]
+            
+            if prev_score is not None:
+                diff = score - prev_score
+                if diff > 0:
+                    trend = f"↑ +{diff:.2f}"
+                elif diff < 0:
+                    trend = f"↓ {diff:.2f}"
+                else:
+                    trend = "→ 0.00"
+            else:
+                trend = "-"
+            
+            lines.append(f"| {display_name} | {score:.2f} | {trend} |")
+            prev_score = score
+        
+        lines.append("")
+        lines.append("")
+        
+        # 5. 每个文档在各阶段的得分对比
+        lines.append("## 5. 文档得分对比\n")
+        
+        # 收集所有文档名称
+        all_doc_names = set()
+        for data in stage_evaluations.values():
+            for evaluation in data["evaluations"]:
+                doc_name = Path(evaluation.target_document).stem
+                all_doc_names.add(doc_name)
+        
+        if all_doc_names:
+            # 表头
+            sorted_stage_names = [s[0] for s in sorted_stages]
+            header = "| 文档 | " + " | ".join(
+                [s.replace("srs_document_", "") for s in sorted_stage_names]
+            ) + " |"
+            lines.append(header)
+            lines.append("|------|" + "|".join(["------" for _ in sorted_stage_names]) + "|")
+            
+            # 为每个文档创建行
+            for doc_name in sorted(all_doc_names):
+                row = f"| {doc_name} |"
+                for stage_name in sorted_stage_names:
+                    # 查找该文档在该阶段的得分
+                    score = None
+                    for evaluation in stage_evaluations[stage_name]["evaluations"]:
+                        if Path(evaluation.target_document).stem == doc_name:
+                            score = OutputFormatter._calculate_weighted_score(evaluation)
+                            break
+                    
+                    if score is not None:
+                        row += f" {score:.2f} |"
+                    else:
+                        row += " - |"
+                
+                lines.append(row)
+        
+        lines.append("")
+        lines.append("")
+        
+        # 6. 总结
+        lines.append("## 6. 总结\n")
+        if sorted_stages:
+            best_stage = sorted_stages[0]
+            best_name = best_stage[0].replace("srs_document_", "")
+            best_score = best_stage[1]["avg_weighted_score"]
+            lines.append(f"- **最佳阶段**：{best_name}（平均加权得分：{best_score:.2f}）")
+            
+            if len(sorted_stages) > 1:
+                first_stage = sorted_stages[-1]
+                last_stage = sorted_stages[0]
+                improvement = last_stage[1]["avg_weighted_score"] - first_stage[1]["avg_weighted_score"]
+                lines.append(f"- **总体提升**：从 {first_stage[0].replace('srs_document_', '')} 到 {last_stage[0].replace('srs_document_', '')}，得分提升 {improvement:.2f} 分")
+        
+        return "\n".join(lines)

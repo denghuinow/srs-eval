@@ -16,9 +16,291 @@ from src.config import load_config
 from src.evaluator import DocumentEvaluation, Evaluator
 from src.output_formatter import OutputFormatter
 from src.point_extractor import PointExtractor
+import re
 
 # 加载环境变量
 load_dotenv()
+
+
+def detect_stages(srs_collection_dir: Path) -> dict[str, list[Path]]:
+    """
+    检测srs_collection目录下的各个阶段
+    
+    Args:
+        srs_collection_dir: srs_collection目录路径
+        
+    Returns:
+        字典，键为阶段名称，值为该阶段下的文档路径列表
+    """
+    stages = {}
+    
+    if not srs_collection_dir.exists() or not srs_collection_dir.is_dir():
+        return stages
+    
+    # 遍历所有子目录
+    for stage_dir in srs_collection_dir.iterdir():
+        if not stage_dir.is_dir():
+            continue
+        
+        stage_name = stage_dir.name
+        # 检查是否是阶段目录（srs_document_开头）
+        if not stage_name.startswith("srs_document_"):
+            continue
+        
+        # 收集该阶段下的所有.md文件
+        md_files = sorted(stage_dir.glob("*.md")) + sorted(stage_dir.glob("*.markdown"))
+        if md_files:
+            stages[stage_name] = md_files
+    
+    return stages
+
+
+def evaluate_stage(
+    stage_docs: list[Path],
+    baseline_path: Path | None,
+    baseline_dir: Path | None,
+    stage_output_dir: Path,
+    config,
+    args,
+    judges: int,
+    logger
+) -> list[DocumentEvaluation]:
+    """
+    评估单个阶段的所有文档
+    
+    Args:
+        stage_docs: 该阶段的文档路径列表
+        baseline_path: 基准文档路径（单个基准文档模式）
+        baseline_dir: 基准文档目录（匹配模式）
+        stage_output_dir: 该阶段的输出目录
+        config: 配置对象
+        args: 命令行参数
+        judges: 评委数量
+        logger: 日志记录器
+        
+    Returns:
+        该阶段的评估结果列表
+    """
+    formatter = OutputFormatter()
+    use_matching_mode = baseline_dir is not None
+    
+    # 如果不是匹配模式，从基准文档提取要点清单
+    checkpoints = None
+    if not use_matching_mode and baseline_path:
+        logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
+        logger.info("-" * 60)
+        try:
+            extractor = PointExtractor(config, prompt_version=config.prompt_version)
+            checkpoints = extractor.extract_points(
+                baseline_path,
+                force_extract=args.force_extract,
+                extract_runs=args.extract_runs,
+            )
+            logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
+            logger.info("")
+        except Exception as e:
+            logger.error(f"提取要点失败: {e}")
+            logger.debug(f"调试信息:", exc_info=True)
+            return []
+    elif use_matching_mode:
+        extractor = PointExtractor(config, prompt_version=config.prompt_version)
+    
+    # 检查已存在的评估结果
+    evaluations = []
+    new_target_paths = []
+    
+    if args.skip_existing:
+        force_re_eval_set = set()
+        if args.force_re_eval:
+            for item in args.force_re_eval:
+                item_path = Path(item)
+                force_re_eval_set.add(item_path.stem)
+        
+        for target_path in stage_docs:
+            doc_name = Path(target_path).stem
+            
+            if args.force_re_eval and doc_name in force_re_eval_set:
+                logger.info(f"🔄 {doc_name} - 强制重新评估")
+                new_target_paths.append(target_path)
+                continue
+            
+            json_path = stage_output_dir / f"{doc_name}_evaluation.json"
+            if json_path.exists():
+                existing_eval = formatter.load_json(json_path)
+                if existing_eval:
+                    evaluations.append(existing_eval)
+                    logger.info(f"⊘ {doc_name} - 已存在，跳过评估")
+                    continue
+            
+            new_target_paths.append(target_path)
+        
+        if evaluations:
+            logger.info(f"已跳过 {len(evaluations)} 个已存在的评估结果")
+        if new_target_paths:
+            logger.info(f"需要评估 {len(new_target_paths)} 个新文档")
+        logger.info("")
+    else:
+        new_target_paths = stage_docs
+    
+    # 评估文档
+    evaluator = Evaluator(config, prompt_version=config.prompt_version)
+    
+    parallel_eval = len(new_target_paths) > 1
+    max_workers = args.max_workers
+    if parallel_eval and new_target_paths:
+        if max_workers is None:
+            max_workers = min(len(new_target_paths), 10)
+        logger.info(f"ℹ 并行执行模式：最大工作线程数 = {max_workers}")
+        logger.info("")
+    
+    def evaluate_document(target_path: Path) -> tuple[Path, DocumentEvaluation | None]:
+        """评估单个文档的函数，用于并行执行"""
+        try:
+            doc_baseline_path = baseline_path
+            doc_checkpoints = checkpoints
+            
+            if use_matching_mode:
+                matched_baseline = find_matching_baseline(target_path, baseline_dir)
+                if matched_baseline is None:
+                    logger.warning(f"未找到 {target_path.name} 的匹配基准文档，跳过评估")
+                    return (target_path, None)
+                doc_baseline_path = matched_baseline
+                
+                try:
+                    doc_checkpoints = extractor.extract_points(
+                        doc_baseline_path,
+                        force_extract=args.force_extract,
+                        extract_runs=args.extract_runs,
+                    )
+                except Exception as e:
+                    logger.error(f"从基准文档 {doc_baseline_path.name} 提取要点失败: {e}")
+                    return (target_path, None)
+            
+            if judges > 1:
+                evaluation = evaluator.evaluate_multiple_runs(
+                    doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
+                )
+            else:
+                start_time = time.time()
+                evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
+                evaluation.model_name = config.openai.model
+                evaluation.baseline_document = str(doc_baseline_path)
+                evaluation.evaluation_time = evaluation_time
+                evaluation.evaluation_duration = time.time() - start_time
+            return (target_path, evaluation)
+        except Exception as e:
+            logger.error(f"评估文档 {target_path} 失败: {e}")
+            logger.debug(f"评估失败详情:", exc_info=True)
+            return (target_path, None)
+    
+    # 执行评估
+    if parallel_eval and new_target_paths:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {executor.submit(evaluate_document, path): path for path in new_target_paths}
+            completed = 0
+            for future in as_completed(future_to_path):
+                completed += 1
+                target_path, evaluation = future.result()
+                if evaluation:
+                    evaluations.append(evaluation)
+                    doc_name = target_path.stem
+                    weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+                    logger.info(f"[{completed}/{len(new_target_paths)}] ✓ {doc_name}: 加权得分={weighted_score:.2f}")
+                else:
+                    logger.error(f"[{completed}/{len(new_target_paths)}] ✗ {target_path.stem}: 评估失败")
+    else:
+        for target_path in new_target_paths:
+            target_path, evaluation = evaluate_document(target_path)
+            if evaluation:
+                evaluations.append(evaluation)
+                doc_name = target_path.stem
+                weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+                logger.info(f"✓ {doc_name}: 加权得分={weighted_score:.2f}")
+            else:
+                logger.error(f"✗ {target_path.stem}: 评估失败")
+    
+    # 保存评估结果
+    for evaluation in evaluations:
+        doc_name = Path(evaluation.target_document).stem
+        
+        json_path = stage_output_dir / f"{doc_name}_evaluation.json"
+        formatter.save_json(evaluation, json_path)
+        
+        if args.output in ["markdown", "all"]:
+            md_path = stage_output_dir / f"{doc_name}_evaluation.md"
+            formatter.save_markdown(evaluation, md_path)
+        
+        tsv_path = stage_output_dir / f"{doc_name}_evaluation.tsv"
+        formatter.save_tsv(evaluation, tsv_path)
+    
+    # 生成CSV汇总
+    if args.output in ["csv", "all"] and evaluations:
+        csv_path = stage_output_dir / "evaluations_summary.csv"
+        formatter.to_csv(evaluations, csv_path)
+        logger.info(f"✓ CSV: {csv_path}")
+    
+    # 生成阶段聚合报告
+    if len(evaluations) > 1:
+        logger.info("")
+        logger.info("正在生成阶段聚合统计报告...")
+        summary_path = stage_output_dir / "summary_report.md"
+        total_time = sum(
+            e.evaluation_duration for e in evaluations 
+            if e.evaluation_duration is not None
+        )
+        
+        target_dir_path = None
+        baseline_dir_path = None
+        if use_matching_mode:
+            baseline_dir_path = baseline_dir
+        
+        formatter.save_summary_report(
+            evaluations,
+            summary_path,
+            baseline_path,
+            target_dir=target_dir_path,
+            baseline_dir=baseline_dir_path,
+            output_dir=stage_output_dir,
+            judges=judges,
+            total_time=total_time,
+        )
+        logger.info(f"✓ 阶段聚合统计报告: {summary_path}")
+    
+    return evaluations
+
+
+def sort_stage_names(stage_names: list[str]) -> list[str]:
+    """
+    对阶段名称进行排序
+    
+    排序规则：
+    1. no-explore-clarify
+    2. no-clarify
+    3. iter1, iter2, iter3, ...
+    
+    Args:
+        stage_names: 阶段名称列表
+        
+    Returns:
+        排序后的阶段名称列表
+    """
+    def stage_key(name: str) -> tuple:
+        """生成排序键"""
+        if name == "srs_document_no-explore-clarify":
+            return (0, 0)
+        elif name == "srs_document_no-clarify":
+            return (1, 0)
+        elif name.startswith("srs_document_iter"):
+            # 提取迭代次数
+            match = re.search(r'iter(\d+)', name)
+            if match:
+                return (2, int(match.group(1)))
+            return (2, 999)  # 无法解析的iter放在最后
+        else:
+            return (3, 0)  # 其他阶段放在最后
+    
+    return sorted(stage_names, key=stage_key)
 
 # 配置日志 - 从环境变量读取日志级别和文件路径
 def get_log_level():
@@ -182,6 +464,11 @@ def main():
         help="待评估文档文件夹路径（批量评估文件夹中的所有 .md 文件）",
     )
     parser.add_argument(
+        "--srs-collection-dir",
+        type=str,
+        help="srs_collection目录路径（自动按阶段分组评估，每个阶段生成独立报告）",
+    )
+    parser.add_argument(
         "--judges",
         type=int,
         default=None,
@@ -248,8 +535,8 @@ def main():
     
     # 如果使用 --extract-cache-only，可以不指定 target
     if not args.extract_cache_only:
-        if not args.target and not args.targets and not args.target_dir:
-            parser.error("必须指定 --target、--targets 或 --target-dir")
+        if not args.target and not args.targets and not args.target_dir and not args.srs_collection_dir:
+            parser.error("必须指定 --target、--targets、--target-dir 或 --srs-collection-dir")
 
     # 加载配置
     try:
@@ -462,8 +749,111 @@ def main():
         if not md_files:
             logger.error(f"待评估文档文件夹中没有找到 .md 文件: {args.target_dir}")
             sys.exit(1)
+        
+        # 如果指定了 --force-re-eval，只评估指定的文件
+        if args.force_re_eval:
+            # 准备强制重新评估的文档名称集合（支持多种格式）
+            force_re_eval_set = set()
+            for item in args.force_re_eval:
+                # 支持文档名称（不含扩展名）或完整路径
+                item_path = Path(item)
+                if item_path.is_absolute() or item_path.exists():
+                    # 是完整路径
+                    force_re_eval_set.add(item_path.stem)
+                else:
+                    # 是文档名称（去掉扩展名以匹配 doc_name 格式）
+                    force_re_eval_set.add(item_path.stem)
+            
+            # 只保留在 force_re_eval_set 中的文件
+            filtered_files = [f for f in md_files if f.stem in force_re_eval_set]
+            if not filtered_files:
+                logger.warning(f"在目录中未找到 --force-re-eval 指定的文件")
+                logger.info(f"  指定的文件: {args.force_re_eval}")
+                logger.info(f"  目录中的文件数量: {len(md_files)}")
+            else:
+                logger.info(f"从待评估文档文件夹中找到 {len(md_files)} 个文档，将只评估 {len(filtered_files)} 个指定文件")
+                md_files = filtered_files
+        else:
+            logger.info(f"从待评估文档文件夹中找到 {len(md_files)} 个文档")
+        
         target_paths.extend(md_files)
-        logger.info(f"从待评估文档文件夹中找到 {len(md_files)} 个文档")
+    
+    # 处理srs_collection目录（按阶段分组评估）
+    stage_evaluations = {}  # 存储每个阶段的评估结果
+    if args.srs_collection_dir:
+        srs_collection_dir = Path(args.srs_collection_dir)
+        if not srs_collection_dir.exists():
+            logger.error(f"srs_collection目录不存在: {args.srs_collection_dir}")
+            sys.exit(1)
+        if not srs_collection_dir.is_dir():
+            logger.error(f"srs_collection路径不是文件夹: {args.srs_collection_dir}")
+            sys.exit(1)
+        
+        # 检测各个阶段
+        stages = detect_stages(srs_collection_dir)
+        if not stages:
+            logger.error(f"在srs_collection目录中未找到任何阶段目录: {args.srs_collection_dir}")
+            sys.exit(1)
+        
+        # 对阶段进行排序
+        sorted_stage_names = sort_stage_names(list(stages.keys()))
+        logger.info(f"检测到 {len(sorted_stage_names)} 个阶段: {', '.join(sorted_stage_names)}")
+        
+        # 为每个阶段进行评估
+        for stage_name in sorted_stage_names:
+            stage_docs = stages[stage_name]
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info(f"开始评估阶段: {stage_name} ({len(stage_docs)} 个文档)")
+            logger.info("=" * 60)
+            
+            # 为每个阶段创建独立的输出目录
+            stage_output_dir = Path(args.output_dir) / stage_name
+            stage_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 评估该阶段的所有文档
+            stage_eval_results = evaluate_stage(
+                stage_docs,
+                baseline_path,
+                baseline_dir,
+                stage_output_dir,
+                config,
+                args,
+                judges,
+                logger
+            )
+            
+            stage_evaluations[stage_name] = {
+                "evaluations": stage_eval_results,
+                "output_dir": stage_output_dir
+            }
+            
+            logger.info(f"阶段 {stage_name} 评估完成，共 {len(stage_eval_results)} 个文档")
+        
+        # 生成跨阶段对比报告
+        if len(stage_evaluations) > 1:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("生成跨阶段对比报告...")
+            logger.info("=" * 60)
+            
+            cross_stage_report_path = Path(args.output_dir) / "cross_stage_comparison.md"
+            formatter = OutputFormatter()
+            cross_stage_report = formatter.generate_cross_stage_comparison_report(
+                stage_evaluations,
+                baseline_dir=baseline_dir,
+                output_dir=Path(args.output_dir)
+            )
+            
+            with open(cross_stage_report_path, "w", encoding="utf-8") as f:
+                f.write(cross_stage_report)
+            
+            logger.info(f"✓ 跨阶段对比报告: {cross_stage_report_path}")
+        
+        # 退出，因为已经完成了所有评估
+        logger.info("")
+        logger.info("所有阶段评估完成！")
+        sys.exit(0)
 
     # 验证待评估文档
     for target_path in target_paths:
@@ -798,29 +1188,77 @@ def main():
         logger.info(f"✓ CSV: {csv_path}")
 
     # 如果有多个评估结果，生成聚合统计报告
-    if len(evaluations) > 1:
+    # 基于输出目录中的所有最新评估结果重新生成聚合报告
+    if len(evaluations) > 1 or output_dir.exists():
         logger.info("")
         logger.info("正在生成聚合统计报告...")
         summary_path = output_dir / "summary_report.md"
         total_time = time.time() - total_start_time
-        # 确定target_dir和baseline_dir
-        target_dir_path = None
-        if args.target_dir:
-            target_dir_path = Path(args.target_dir)
-        baseline_dir_path = None
-        if args.baseline_dir:
-            baseline_dir_path = Path(args.baseline_dir)
-        formatter.save_summary_report(
-            evaluations, 
-            summary_path, 
-            baseline_path,
-            target_dir=target_dir_path,
-            baseline_dir=baseline_dir_path,
-            output_dir=output_dir,
-            judges=judges,
-            total_time=total_time,
-        )
-        logger.info(f"✓ 聚合统计报告: {summary_path}")
+        
+        # 从输出目录中加载所有评估结果（基于最新数据）
+        all_evaluations = []
+        json_files = sorted(output_dir.glob("*_evaluation.json"))
+        
+        if json_files:
+            logger.info(f"从输出目录加载 {len(json_files)} 个评估结果...")
+            for json_file in json_files:
+                eval_result = formatter.load_json(json_file)
+                if eval_result:
+                    all_evaluations.append(eval_result)
+            
+            if all_evaluations:
+                logger.info(f"成功加载 {len(all_evaluations)} 个评估结果")
+            else:
+                logger.warning("未能加载任何评估结果，使用本次评估的结果")
+                all_evaluations = evaluations
+        else:
+            # 如果没有JSON文件，使用本次评估的结果
+            all_evaluations = evaluations
+        
+        # 如果使用了 --force-re-eval，只包含指定的文件
+        report_evaluations = all_evaluations
+        if args.force_re_eval:
+            # 准备强制重新评估的文档名称集合
+            force_re_eval_set = set()
+            for item in args.force_re_eval:
+                item_path = Path(item)
+                if item_path.is_absolute() or item_path.exists():
+                    force_re_eval_set.add(item_path.stem)
+                else:
+                    force_re_eval_set.add(item_path.stem)
+            
+            # 只保留指定的文件（在 force_re_eval_set 中的文件）
+            report_evaluations = [
+                eval for eval in all_evaluations 
+                if Path(eval.target_document).stem in force_re_eval_set
+            ]
+            
+            if len(report_evaluations) != len(all_evaluations):
+                logger.info(f"聚合报告将只包含指定的 {len(report_evaluations)} 个文件（输出目录中共 {len(all_evaluations)} 个评估结果）")
+        
+        if len(report_evaluations) > 1:
+            # 确定target_dir和baseline_dir
+            target_dir_path = None
+            if args.target_dir:
+                target_dir_path = Path(args.target_dir)
+            baseline_dir_path = None
+            if args.baseline_dir:
+                baseline_dir_path = Path(args.baseline_dir)
+            formatter.save_summary_report(
+                report_evaluations, 
+                summary_path, 
+                baseline_path,
+                target_dir=target_dir_path,
+                baseline_dir=baseline_dir_path,
+                output_dir=output_dir,
+                judges=judges,
+                total_time=total_time,
+            )
+            logger.info(f"✓ 聚合统计报告: {summary_path} (基于 {len(report_evaluations)} 个评估结果)")
+        elif len(report_evaluations) == 1:
+            logger.info("只有1个评估结果，跳过聚合报告生成")
+        else:
+            logger.warning("没有评估结果，跳过聚合报告生成")
 
     logger.info("")
     logger.info("评估完成！")
