@@ -5,6 +5,7 @@ import logging
 import os
 import statistics
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -26,6 +27,10 @@ def detect_stages(srs_collection_dir: Path) -> dict[str, list[Path]]:
     """
     检测srs_collection目录下的各个阶段
     
+    支持两种目录结构：
+    1. srs_document_* 开头的目录（原有格式）
+    2. req_* 开头的目录（req_collection格式）
+    
     Args:
         srs_collection_dir: srs_collection目录路径
         
@@ -43,8 +48,8 @@ def detect_stages(srs_collection_dir: Path) -> dict[str, list[Path]]:
             continue
         
         stage_name = stage_dir.name
-        # 检查是否是阶段目录（srs_document_开头）
-        if not stage_name.startswith("srs_document_"):
+        # 检查是否是阶段目录（srs_document_开头 或 req_开头）
+        if not (stage_name.startswith("srs_document_") or stage_name.startswith("req_")):
             continue
         
         # 收集该阶段下的所有.md文件
@@ -55,280 +60,100 @@ def detect_stages(srs_collection_dir: Path) -> dict[str, list[Path]]:
     return stages
 
 
-def evaluate_stage(
-    stage_docs: list[Path],
+def evaluate_single_document_with_stage(
+    target_path: Path,
+    stage_name: str,
+    stage_output_dir: Path,
     baseline_path: Path | None,
     baseline_dir: Path | None,
-    stage_output_dir: Path,
+    checkpoints: list[str] | None,
+    extractor: PointExtractor | None,
+    evaluator: Evaluator,
     config,
     args,
     judges: int,
     logger,
-    output_dir: Path | None = None,
-    stage_name: str | None = None
-) -> list[DocumentEvaluation]:
+    use_matching_mode: bool
+) -> tuple[Path, DocumentEvaluation | None, str]:
     """
-    评估单个阶段的所有文档
+    评估单个文档（带阶段信息），用于跨阶段全局并行执行
     
     Args:
-        stage_docs: 该阶段的文档路径列表
+        target_path: 待评估文档路径
+        stage_name: 阶段名称
+        stage_output_dir: 阶段输出目录
         baseline_path: 基准文档路径（单个基准文档模式）
         baseline_dir: 基准文档目录（匹配模式）
-        stage_output_dir: 该阶段的输出目录
+        checkpoints: 检查项清单（单个基准文档模式时使用）
+        extractor: 要点提取器（匹配模式时使用）
+        evaluator: 评估器
         config: 配置对象
         args: 命令行参数
         judges: 评委数量
         logger: 日志记录器
-        output_dir: 输出根目录（用于保存汇总报告，如果为None则使用stage_output_dir）
-        stage_name: 阶段名称（用于生成汇总报告文件名，如 "srs_document_iter1"）
+        use_matching_mode: 是否使用匹配模式
         
     Returns:
-        该阶段的评估结果列表
+        (target_path, evaluation, stage_name) 元组
     """
     formatter = OutputFormatter()
-    use_matching_mode = baseline_dir is not None
     
-    # 如果不是匹配模式，从基准文档提取要点清单
-    checkpoints = None
-    if not use_matching_mode and baseline_path:
-        logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
-        logger.info("-" * 60)
-        try:
-            extractor = PointExtractor(config, prompt_version=config.prompt_version)
-            checkpoints = extractor.extract_points(
-                baseline_path,
-                force_extract=args.force_extract,
-                extract_runs=args.extract_runs,
-            )
-            logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
-            logger.info("")
-        except Exception as e:
-            logger.error(f"提取要点失败: {e}")
-            logger.debug(f"调试信息:", exc_info=True)
-            return []
-    elif use_matching_mode:
-        extractor = PointExtractor(config, prompt_version=config.prompt_version)
-    
-    # 检查已存在的评估结果
-    evaluations = []
-    new_target_paths = []
-    
-    if args.skip_existing:
-        force_re_eval_set = set()
-        if args.force_re_eval:
-            for item in args.force_re_eval:
-                item_path = Path(item)
-                force_re_eval_set.add(item_path.stem)
+    try:
+        doc_baseline_path = baseline_path
+        doc_checkpoints = checkpoints
         
-        for target_path in stage_docs:
-            doc_name = Path(target_path).stem
+        if use_matching_mode:
+            matched_baseline = find_matching_baseline(target_path, baseline_dir)
+            if matched_baseline is None:
+                logger.warning(f"未找到 {target_path.name} 的匹配基准文档，跳过评估")
+                return (target_path, None, stage_name)
+            doc_baseline_path = matched_baseline
             
-            if args.force_re_eval and doc_name in force_re_eval_set:
-                logger.info(f"🔄 {doc_name} - 强制重新评估")
-                new_target_paths.append(target_path)
-                continue
-            
-            json_path = stage_output_dir / f"{doc_name}_evaluation.json"
-            if json_path.exists():
-                existing_eval = formatter.load_json(json_path)
-                if existing_eval:
-                    evaluations.append(existing_eval)
-                    logger.info(f"⊘ {doc_name} - 已存在，跳过评估")
-                    continue
-            
-            new_target_paths.append(target_path)
-        
-        if evaluations:
-            logger.info(f"已跳过 {len(evaluations)} 个已存在的评估结果")
-        if new_target_paths:
-            logger.info(f"需要评估 {len(new_target_paths)} 个新文档")
-        logger.info("")
-    else:
-        new_target_paths = stage_docs
-    
-    # 评估文档
-    evaluator = Evaluator(config, prompt_version=config.prompt_version)
-    
-    parallel_eval = len(new_target_paths) > 1
-    max_workers = args.max_workers
-    if parallel_eval and new_target_paths:
-        if max_workers is None:
-            max_workers = min(len(new_target_paths), 10)
-        logger.info(f"ℹ 并行执行模式：最大工作线程数 = {max_workers}")
-        logger.info("")
-    
-    def evaluate_document(target_path: Path) -> tuple[Path, DocumentEvaluation | None]:
-        """评估单个文档的函数，用于并行执行"""
-        try:
-            doc_baseline_path = baseline_path
-            doc_checkpoints = checkpoints
-            
-            if use_matching_mode:
-                matched_baseline = find_matching_baseline(target_path, baseline_dir)
-                if matched_baseline is None:
-                    logger.warning(f"未找到 {target_path.name} 的匹配基准文档，跳过评估")
-                    return (target_path, None)
-                doc_baseline_path = matched_baseline
-                
-                try:
-                    doc_checkpoints = extractor.extract_points(
-                        doc_baseline_path,
-                        force_extract=args.force_extract,
-                        extract_runs=args.extract_runs,
-                    )
-                except Exception as e:
-                    logger.error(f"从基准文档 {doc_baseline_path.name} 提取要点失败: {e}")
-                    return (target_path, None)
-            
-            if judges > 1:
-                evaluation = evaluator.evaluate_multiple_runs(
-                    doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
+            try:
+                doc_checkpoints = extractor.extract_points(
+                    doc_baseline_path,
+                    force_extract=args.force_extract,
+                    extract_runs=args.extract_runs,
                 )
-            else:
-                start_time = time.time()
-                evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
-                evaluation.model_name = config.openai.model
-                evaluation.baseline_document = str(doc_baseline_path)
-                evaluation.evaluation_time = evaluation_time
-                evaluation.evaluation_duration = time.time() - start_time
-            return (target_path, evaluation)
-        except Exception as e:
-            logger.error(f"评估文档 {target_path} 失败: {e}")
-            logger.debug(f"评估失败详情:", exc_info=True)
-            return (target_path, None)
-    
-    def save_evaluation_immediately(evaluation: DocumentEvaluation):
-        """立即保存单个评估结果"""
-        doc_name = Path(evaluation.target_document).stem
+            except Exception as e:
+                logger.error(f"从基准文档 {doc_baseline_path.name} 提取要点失败: {e}")
+                return (target_path, None, stage_name)
         
-        # 保存JSON文件
-        json_path = stage_output_dir / f"{doc_name}_evaluation.json"
-        formatter.save_json(evaluation, json_path)
-        logger.info(f"  ✓ JSON: {json_path.name}")
-        
-        # 保存Markdown文件
-        if args.output in ["markdown", "all"]:
-            md_path = stage_output_dir / f"{doc_name}_evaluation.md"
-            formatter.save_markdown(evaluation, md_path)
-            logger.info(f"  ✓ Markdown: {md_path.name}")
-        
-        # 保存TSV文件
-        tsv_path = stage_output_dir / f"{doc_name}_evaluation.tsv"
-        formatter.save_tsv(evaluation, tsv_path)
-        logger.info(f"  ✓ TSV: {tsv_path.name}")
-    
-    def update_summary_report(current_evaluations: list[DocumentEvaluation]):
-        """更新阶段聚合报告"""
-        # 合并已存在的评估结果和当前新评估的结果
-        all_eval_results = list(evaluations)  # 已存在的评估结果
-        
-        # 重新加载所有评估结果（包括已存在的和新评估的）
-        json_files = sorted(stage_output_dir.glob("*_evaluation.json"))
-        loaded_eval_results = []
-        loaded_doc_names = set()
-        
-        for json_file in json_files:
-            eval_result = formatter.load_json(json_file)
-            if eval_result:
-                doc_name = Path(eval_result.target_document).stem
-                loaded_eval_results.append(eval_result)
-                loaded_doc_names.add(doc_name)
-        
-        # 如果加载的结果数量足够，使用加载的结果（更完整）
-        if len(loaded_eval_results) >= len(current_evaluations):
-            all_eval_results = loaded_eval_results
-        else:
-            # 否则合并当前评估结果和已存在的
-            all_eval_results.extend(current_evaluations)
-        
-        if len(all_eval_results) < 1:
-            return
-        
-        # 确定汇总文件的保存位置和文件名
-        report_output_dir = output_dir if output_dir else stage_output_dir
-        
-        # 从stage_name提取阶段标识（如 "srs_document_iter1" -> "iter1"）
-        if stage_name:
-            # 移除 "srs_document_" 前缀
-            stage_identifier = stage_name.replace("srs_document_", "")
-        else:
-            # 如果没有提供stage_name，使用阶段目录名
-            stage_identifier = stage_output_dir.name.replace("srs_document_", "")
-        
-        # 更新CSV汇总（保存在输出根目录）
-        if args.output in ["csv", "all"]:
-            csv_filename = f"evaluations_summary_{stage_identifier}.csv"
-            csv_path = report_output_dir / csv_filename
-            formatter.to_csv(all_eval_results, csv_path)
-            logger.info(f"  ✓ 已更新CSV汇总: {csv_path.name}")
-        
-        # 更新阶段聚合报告（保存在输出根目录，文件名为 summary_report_{stage_name}.md）
-        if len(all_eval_results) > 1:
-            summary_filename = f"summary_report_{stage_identifier}.md"
-            
-            summary_path = report_output_dir / summary_filename
-            total_time = sum(
-                e.evaluation_duration for e in all_eval_results 
-                if e.evaluation_duration is not None
+        if judges > 1:
+            evaluation = evaluator.evaluate_multiple_runs(
+                doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
             )
+        else:
+            start_time = time.time()
+            evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
+            evaluation.model_name = config.openai.model
+            evaluation.baseline_document = str(doc_baseline_path)
+            evaluation.evaluation_time = evaluation_time
+            evaluation.evaluation_duration = time.time() - start_time
+        
+        # 立即保存评估结果
+        if evaluation:
+            doc_name = Path(evaluation.target_document).stem
             
-            target_dir_path = None
-            baseline_dir_path = None
-            if use_matching_mode:
-                baseline_dir_path = baseline_dir
+            # 保存JSON文件
+            json_path = stage_output_dir / f"{doc_name}_evaluation.json"
+            formatter.save_json(evaluation, json_path)
             
-            formatter.save_summary_report(
-                all_eval_results,
-                summary_path,
-                baseline_path,
-                target_dir=target_dir_path,
-                baseline_dir=baseline_dir_path,
-                output_dir=stage_output_dir,  # 报告内容中引用的输出目录仍然是阶段目录
-                judges=judges,
-                total_time=total_time,
-            )
-            logger.info(f"  ✓ 已更新阶段聚合报告: {summary_path.name} (共 {len(all_eval_results)} 个评估结果)")
-    
-    # 执行评估（每完成一个立即保存）
-    if parallel_eval and new_target_paths:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_path = {executor.submit(evaluate_document, path): path for path in new_target_paths}
-            completed = 0
-            for future in as_completed(future_to_path):
-                completed += 1
-                target_path, evaluation = future.result()
-                if evaluation:
-                    evaluations.append(evaluation)
-                    doc_name = target_path.stem
-                    weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
-                    logger.info(f"[{completed}/{len(new_target_paths)}] ✓ {doc_name}: 加权得分={weighted_score:.2f}")
-                    
-                    # 立即保存该文档的评估结果
-                    save_evaluation_immediately(evaluation)
-                    
-                    # 更新汇总报告
-                    update_summary_report(evaluations)
-                else:
-                    logger.error(f"[{completed}/{len(new_target_paths)}] ✗ {target_path.stem}: 评估失败")
-    else:
-        for target_path in new_target_paths:
-            target_path, evaluation = evaluate_document(target_path)
-            if evaluation:
-                evaluations.append(evaluation)
-                doc_name = target_path.stem
-                weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
-                logger.info(f"✓ {doc_name}: 加权得分={weighted_score:.2f}")
-                
-                # 立即保存该文档的评估结果
-                save_evaluation_immediately(evaluation)
-                
-                # 更新汇总报告
-                update_summary_report(evaluations)
-            else:
-                logger.error(f"✗ {target_path.stem}: 评估失败")
-    
-    return evaluations
+            # 保存Markdown文件
+            if args.output in ["markdown", "all"]:
+                md_path = stage_output_dir / f"{doc_name}_evaluation.md"
+                formatter.save_markdown(evaluation, md_path)
+            
+            # 保存TSV文件
+            tsv_path = stage_output_dir / f"{doc_name}_evaluation.tsv"
+            formatter.save_tsv(evaluation, tsv_path)
+        
+        return (target_path, evaluation, stage_name)
+    except Exception as e:
+        logger.error(f"评估文档 {target_path} 失败: {e}")
+        logger.debug(f"评估失败详情:", exc_info=True)
+        return (target_path, None, stage_name)
 
 
 def sort_stage_names(stage_names: list[str]) -> list[str]:
@@ -340,6 +165,10 @@ def sort_stage_names(stage_names: list[str]) -> list[str]:
     2. no-clarify
     3. iter1, iter2, iter3, ...
     
+    支持两种格式：
+    - srs_document_* 格式（原有格式）
+    - req_* 格式（req_collection格式）
+    
     Args:
         stage_names: 阶段名称列表
         
@@ -348,11 +177,24 @@ def sort_stage_names(stage_names: list[str]) -> list[str]:
     """
     def stage_key(name: str) -> tuple:
         """生成排序键"""
+        # 处理 srs_document_ 格式
         if name == "srs_document_no-explore-clarify":
             return (0, 0)
         elif name == "srs_document_no-clarify":
             return (1, 0)
         elif name.startswith("srs_document_iter"):
+            # 提取迭代次数
+            match = re.search(r'iter(\d+)', name)
+            if match:
+                return (2, int(match.group(1)))
+            return (2, 999)  # 无法解析的iter放在最后
+        
+        # 处理 req_ 格式
+        elif name == "req_no-explore-clarify":
+            return (0, 0)
+        elif name == "req_no-clarify":
+            return (1, 0)
+        elif name.startswith("req_iter"):
             # 提取迭代次数
             match = re.search(r'iter(\d+)', name)
             if match:
@@ -860,38 +702,301 @@ def main():
         sorted_stage_names = sort_stage_names(list(stages.keys()))
         logger.info(f"检测到 {len(sorted_stage_names)} 个阶段: {', '.join(sorted_stage_names)}")
         
-        # 为每个阶段进行评估
+        # 收集所有阶段的待评估文档
+        formatter = OutputFormatter()
+        all_docs_with_stage = []  # [(stage_name, doc_path, stage_output_dir), ...]
+        stage_evaluations_existing = {}  # 存储每个阶段已存在的评估结果
+        stage_output_dirs = {}  # 存储每个阶段的输出目录
+        
+        use_matching_mode = baseline_dir is not None
+        
+        # 遍历所有阶段，收集待评估文档
         for stage_name in sorted_stage_names:
             stage_docs = stages[stage_name]
-            logger.info("")
-            logger.info("=" * 60)
-            logger.info(f"开始评估阶段: {stage_name} ({len(stage_docs)} 个文档)")
-            logger.info("=" * 60)
-            
-            # 为每个阶段创建独立的输出目录
             stage_output_dir = Path(args.output_dir) / stage_name
             stage_output_dir.mkdir(parents=True, exist_ok=True)
+            stage_output_dirs[stage_name] = stage_output_dir
             
-            # 评估该阶段的所有文档
-            stage_eval_results = evaluate_stage(
-                stage_docs,
-                baseline_path,
-                baseline_dir,
-                stage_output_dir,
-                config,
-                args,
-                judges,
-                logger,
-                output_dir=Path(args.output_dir),  # 传递输出根目录
-                stage_name=stage_name  # 传递阶段名称
-            )
+            # 检查已存在的评估结果
+            existing_evaluations = []
+            new_docs = []
+            
+            if args.skip_existing:
+                force_re_eval_set = set()
+                if args.force_re_eval:
+                    for item in args.force_re_eval:
+                        item_path = Path(item)
+                        force_re_eval_set.add(item_path.stem)
+                
+                for doc_path in stage_docs:
+                    doc_name = doc_path.stem
+                    
+                    if args.force_re_eval and doc_name in force_re_eval_set:
+                        logger.info(f"🔄 {doc_name} - 强制重新评估")
+                        new_docs.append((stage_name, doc_path, stage_output_dir))
+                        continue
+                    
+                    json_path = stage_output_dir / f"{doc_name}_evaluation.json"
+                    if json_path.exists():
+                        existing_eval = formatter.load_json(json_path)
+                        if existing_eval:
+                            existing_evaluations.append(existing_eval)
+                            logger.info(f"⊘ {doc_name} - 已存在，跳过评估")
+                            continue
+                    
+                    new_docs.append((stage_name, doc_path, stage_output_dir))
+            else:
+                for doc_path in stage_docs:
+                    new_docs.append((stage_name, doc_path, stage_output_dir))
+            
+            if existing_evaluations:
+                stage_evaluations_existing[stage_name] = existing_evaluations
+                logger.info(f"阶段 {stage_name}: 已跳过 {len(existing_evaluations)} 个已存在的评估结果")
+            
+            all_docs_with_stage.extend(new_docs)
+        
+        total_docs_to_eval = len(all_docs_with_stage)
+        total_existing = sum(len(evals) for evals in stage_evaluations_existing.values())
+        
+        if total_existing > 0:
+            logger.info(f"总计: 已跳过 {total_existing} 个已存在的评估结果")
+        if total_docs_to_eval > 0:
+            logger.info(f"总计: 需要评估 {total_docs_to_eval} 个新文档，分布在 {len(sorted_stage_names)} 个阶段")
+        logger.info("")
+        
+        # 如果不是匹配模式，预先提取 checkpoints（所有文档共享）
+        checkpoints = None
+        extractor = None
+        if not use_matching_mode and baseline_path:
+            logger.info(f"正在从基准文档提取要点清单: {baseline_path}")
+            logger.info("-" * 60)
+            try:
+                extractor = PointExtractor(config, prompt_version=config.prompt_version)
+                checkpoints = extractor.extract_points(
+                    baseline_path,
+                    force_extract=args.force_extract,
+                    extract_runs=args.extract_runs,
+                )
+                logger.info(f"✓ 检查项清单：共 {len(checkpoints)} 个检查项")
+                logger.info("")
+            except Exception as e:
+                logger.error(f"提取要点失败: {e}")
+                logger.debug(f"调试信息:", exc_info=True)
+                sys.exit(1)
+        elif use_matching_mode:
+            extractor = PointExtractor(config, prompt_version=config.prompt_version)
+        
+        # 创建评估器
+        evaluator = Evaluator(config, prompt_version=config.prompt_version)
+        
+        # 全局并行执行所有文档
+        if total_docs_to_eval > 0:
+            max_workers = args.max_workers
+            if max_workers is None:
+                max_workers = min(total_docs_to_eval, 10)
+            
+            logger.info("=" * 60)
+            logger.info(f"开始跨阶段全局并行评估")
+            logger.info(f"  待评估文档数: {total_docs_to_eval}")
+            logger.info(f"  最大工作线程数: {max_workers}")
+            logger.info("=" * 60)
+            logger.info("")
+            
+            # 用于线程安全的阶段结果组织
+            stage_evaluations_new = {stage_name: [] for stage_name in sorted_stage_names}
+            stage_locks = {stage_name: threading.Lock() for stage_name in sorted_stage_names}
+            stage_last_update_count = {stage_name: 0 for stage_name in sorted_stage_names}  # 跟踪每个阶段上次更新的评估结果数量
+            completed_count = 0
+            completed_lock = threading.Lock()
+            
+            def update_stage_summary_report(stage_name: str):
+                """更新阶段汇总报告（线程安全）"""
+                with stage_locks[stage_name]:
+                    stage_output_dir = stage_output_dirs[stage_name]
+                    all_eval_results = []
+                    
+                    # 加载已存在的评估结果
+                    if stage_name in stage_evaluations_existing:
+                        all_eval_results.extend(stage_evaluations_existing[stage_name])
+                    
+                    # 添加新评估的结果
+                    all_eval_results.extend(stage_evaluations_new[stage_name])
+                    
+                    # 重新加载所有评估结果（包括已存在的和新评估的）
+                    json_files = sorted(stage_output_dir.glob("*_evaluation.json"))
+                    loaded_eval_results = []
+                    
+                    for json_file in json_files:
+                        eval_result = formatter.load_json(json_file)
+                        if eval_result:
+                            loaded_eval_results.append(eval_result)
+                    
+                    # 如果加载的结果数量足够，使用加载的结果（更完整）
+                    if len(loaded_eval_results) >= len(all_eval_results):
+                        all_eval_results = loaded_eval_results
+                    
+                    if len(all_eval_results) < 1:
+                        return
+                    
+                    # 确定汇总文件的保存位置和文件名
+                    report_output_dir = Path(args.output_dir)
+                    
+                    # 从stage_name提取阶段标识
+                    stage_identifier = stage_name.replace("srs_document_", "")
+                    
+                    # 更新CSV汇总
+                    if args.output in ["csv", "all"]:
+                        csv_filename = f"evaluations_summary_{stage_identifier}.csv"
+                        csv_path = report_output_dir / csv_filename
+                        formatter.to_csv(all_eval_results, csv_path)
+                    
+                    # 更新阶段聚合报告
+                    if len(all_eval_results) > 1:
+                        summary_filename = f"summary_report_{stage_identifier}.md"
+                        summary_path = report_output_dir / summary_filename
+                        total_time = sum(
+                            e.evaluation_duration for e in all_eval_results 
+                            if e.evaluation_duration is not None
+                        )
+                        
+                        target_dir_path = None
+                        baseline_dir_path = None
+                        if use_matching_mode:
+                            baseline_dir_path = baseline_dir
+                        
+                        formatter.save_summary_report(
+                            all_eval_results,
+                            summary_path,
+                            baseline_path,
+                            target_dir=target_dir_path,
+                            baseline_dir=baseline_dir_path,
+                            output_dir=stage_output_dir,
+                            judges=judges,
+                            total_time=total_time,
+                        )
+            
+            # 并行执行评估
+            if total_docs_to_eval > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_doc = {
+                        executor.submit(
+                            evaluate_single_document_with_stage,
+                            doc_path,
+                            stage_name,
+                            stage_output_dir,
+                            baseline_path,
+                            baseline_dir,
+                            checkpoints,
+                            extractor,
+                            evaluator,
+                            config,
+                            args,
+                            judges,
+                            logger,
+                            use_matching_mode
+                        ): (stage_name, doc_path, stage_output_dir)
+                        for stage_name, doc_path, stage_output_dir in all_docs_with_stage
+                    }
+                    
+                    for future in as_completed(future_to_doc):
+                        completed_count += 1
+                        target_path, evaluation, result_stage_name = future.result()
+                        
+                        if evaluation:
+                            # 线程安全地添加到阶段结果
+                            should_update_report = False
+                            with stage_locks[result_stage_name]:
+                                stage_evaluations_new[result_stage_name].append(evaluation)
+                                # 检查该阶段是否有新的评估结果（相比上次更新）
+                                current_count = len(stage_evaluations_new[result_stage_name])
+                                if current_count > stage_last_update_count[result_stage_name]:
+                                    should_update_report = True
+                                    stage_last_update_count[result_stage_name] = current_count
+                            
+                            doc_name = target_path.stem
+                            weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+                            
+                            with completed_lock:
+                                logger.info(f"[{completed_count}/{total_docs_to_eval}] ✓ {doc_name} ({result_stage_name}): 加权得分={weighted_score:.2f}")
+                            
+                            # 更新阶段汇总报告（每个阶段有新的评估结果时立即更新）
+                            if should_update_report:
+                                update_stage_summary_report(result_stage_name)
+                        else:
+                            with completed_lock:
+                                logger.error(f"[{completed_count}/{total_docs_to_eval}] ✗ {target_path.stem} ({result_stage_name}): 评估失败")
+                    
+                    # 所有文档评估完成后，确保所有阶段的报告都已更新
+                    logger.info("")
+                    logger.info("正在更新所有阶段的汇总报告...")
+                    for stage_name in sorted_stage_names:
+                        if len(stage_evaluations_new[stage_name]) > 0:
+                            update_stage_summary_report(stage_name)
+            else:
+                # 只有一个文档，串行执行
+                stage_name, doc_path, stage_output_dir = all_docs_with_stage[0]
+                target_path, evaluation, result_stage_name = evaluate_single_document_with_stage(
+                    doc_path,
+                    stage_name,
+                    stage_output_dir,
+                    baseline_path,
+                    baseline_dir,
+                    checkpoints,
+                    extractor,
+                    evaluator,
+                    config,
+                    args,
+                    judges,
+                    logger,
+                    use_matching_mode
+                )
+                
+                if evaluation:
+                    stage_evaluations_new[result_stage_name].append(evaluation)
+                    doc_name = target_path.stem
+                    weighted_score = OutputFormatter._calculate_weighted_score(evaluation)
+                    logger.info(f"✓ {doc_name} ({result_stage_name}): 加权得分={weighted_score:.2f}")
+                    update_stage_summary_report(result_stage_name)
+                else:
+                    logger.error(f"✗ {target_path.stem} ({result_stage_name}): 评估失败")
+            
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("跨阶段全局并行评估完成")
+            logger.info("=" * 60)
+            logger.info("")
+        
+        # 按阶段汇总所有评估结果（包括已存在的和新评估的）
+        for stage_name in sorted_stage_names:
+            stage_output_dir = stage_output_dirs[stage_name]
+            all_stage_evaluations = []
+            
+            # 加载已存在的评估结果
+            if stage_name in stage_evaluations_existing:
+                all_stage_evaluations.extend(stage_evaluations_existing[stage_name])
+            
+            # 添加新评估的结果
+            if stage_name in stage_evaluations_new:
+                all_stage_evaluations.extend(stage_evaluations_new[stage_name])
+            
+            # 重新加载所有评估结果（确保完整性）
+            json_files = sorted(stage_output_dir.glob("*_evaluation.json"))
+            loaded_eval_results = []
+            for json_file in json_files:
+                eval_result = formatter.load_json(json_file)
+                if eval_result:
+                    loaded_eval_results.append(eval_result)
+            
+            # 如果加载的结果数量足够，使用加载的结果（更完整）
+            if len(loaded_eval_results) >= len(all_stage_evaluations):
+                all_stage_evaluations = loaded_eval_results
             
             stage_evaluations[stage_name] = {
-                "evaluations": stage_eval_results,
+                "evaluations": all_stage_evaluations,
                 "output_dir": stage_output_dir
             }
             
-            logger.info(f"阶段 {stage_name} 评估完成，共 {len(stage_eval_results)} 个文档")
+            logger.info(f"阶段 {stage_name} 评估完成，共 {len(all_stage_evaluations)} 个文档")
         
         # 生成跨阶段对比报告
         if len(stage_evaluations) > 1:
