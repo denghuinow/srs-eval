@@ -103,13 +103,45 @@ class Evaluator:
 
     @staticmethod
     def _deduplicate_checkpoints(checkpoints: list[str]) -> list[str]:
-        """去重检查项，保持顺序"""
+        """
+        去重检查项，保持顺序，同时过滤掉未定义类别
+        
+        只保留标准类别：FUNCTIONAL, BUSINESS_FLOW, BOUNDARY, EXCEPTION, DATA_STATE, CONSISTENCY_RULE
+        """
+        # 标准类别列表
+        STANDARD_CATEGORIES = {
+            "FUNCTIONAL",
+            "BUSINESS_FLOW",
+            "BOUNDARY",
+            "EXCEPTION",
+            "DATA_STATE",
+            "CONSISTENCY_RULE",
+        }
+        
         seen = set()
         unique = []
+        filtered_count = 0
+        
         for cp in checkpoints:
+            # 解析类别
+            category, _ = split_checkpoint_category(cp)
+            
+            # 只保留标准类别的检查项
+            if category not in STANDARD_CATEGORIES:
+                filtered_count += 1
+                continue
+            
+            # 去重
             if cp not in seen:
                 seen.add(cp)
                 unique.append(cp)
+        
+        if filtered_count > 0:
+            logger.info(
+                f"过滤掉 {filtered_count} 个未定义类别的检查项 "
+                f"(仅保留标准类别: {', '.join(sorted(STANDARD_CATEGORIES))})"
+            )
+        
         return unique
 
     @staticmethod
