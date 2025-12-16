@@ -16,6 +16,7 @@ from openai import OpenAI, APIError, APITimeoutError, InternalServerError
 from src.config import Config, load_config
 from src.document_parser import DocumentParser
 from src.utils.checkpoint_utils import split_checkpoint_category
+from src.utils.eval_cache import EvaluationCache
 from src.utils.token_counter import calculate_adjusted_max_tokens, count_tokens
 
 # 配置日志
@@ -100,6 +101,62 @@ class Evaluator:
             timeout=self.config.openai.timeout,
         )
         self.parser = DocumentParser()
+        self.eval_cache = EvaluationCache()
+
+    @staticmethod
+    def _serialize_checkpoint_result(cp: CheckpointResult) -> dict[str, Any]:
+        return {
+            "checkpoint": cp.checkpoint,
+            "raw_checkpoint": cp.raw_checkpoint,
+            "category": cp.category,
+            "passed": cp.passed,
+            "pass_rate": getattr(cp, "pass_rate", None),
+        }
+
+    @staticmethod
+    def _deserialize_checkpoint_result(data: dict[str, Any]) -> CheckpointResult:
+        return CheckpointResult(
+            checkpoint=data.get("checkpoint", ""),
+            passed=data.get("passed", False),
+            pass_rate=data.get("pass_rate"),
+            category=data.get("category"),
+            raw_checkpoint=data.get("raw_checkpoint"),
+        )
+
+    def _serialize_evaluation(self, evaluation: DocumentEvaluation) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "target_document": evaluation.target_document,
+            "checkpoints": evaluation.checkpoints,
+            "checkpoint_results": [
+                self._serialize_checkpoint_result(cp) for cp in evaluation.checkpoint_results
+            ],
+        }
+        if evaluation.all_judge_results:
+            payload["all_judge_results"] = [
+                [self._serialize_checkpoint_result(cp) for cp in judge_results]
+                for judge_results in evaluation.all_judge_results
+            ]
+        return payload
+
+    def _deserialize_evaluation(self, data: dict[str, Any]) -> DocumentEvaluation:
+        checkpoint_results = [
+            self._deserialize_checkpoint_result(cp_data)
+            for cp_data in data.get("checkpoint_results", [])
+        ]
+        all_judge_results_data = data.get("all_judge_results")
+        all_judge_results = None
+        if all_judge_results_data:
+            all_judge_results = [
+                [self._deserialize_checkpoint_result(cp) for cp in judge_list]
+                for judge_list in all_judge_results_data
+            ]
+        evaluation = DocumentEvaluation(
+            target_document=data.get("target_document", ""),
+            checkpoints=data.get("checkpoints", []),
+            checkpoint_results=checkpoint_results,
+            all_judge_results=all_judge_results,
+        )
+        return evaluation
 
     @staticmethod
     def _deduplicate_checkpoints(checkpoints: list[str]) -> list[str]:
@@ -880,6 +937,8 @@ class Evaluator:
         self,
         checkpoints: list[str],
         target_document_path: str | Path,
+        target_content: str | None = None,
+        enable_cache: bool = True,
     ) -> DocumentEvaluation:
         """
         单次评估运行
@@ -887,14 +946,18 @@ class Evaluator:
         Args:
             checkpoints: 检查项清单
             target_document_path: 待评估文档路径
+            target_content: 预先加载的文档内容（可选）
+            enable_cache: 是否允许命中缓存
 
         Returns:
             评估结果
         """
         # 读取待评估文档内容
-        target_content = self.parser.read_markdown(target_document_path)
+        if target_content is None:
+            target_content = self.parser.read_markdown(target_document_path)
         logger.info(f"开始评估文档: {target_document_path}")
         logger.debug(f"文档内容长度: {len(target_content)} 字符")
+        doc_hash = EvaluationCache.hash_text(target_content)
 
         # 加载prompt模板
         template = self._load_prompt_template("evaluate_points.md")
@@ -908,6 +971,26 @@ class Evaluator:
                 f"(已去除 {original_count - len(unique_checkpoints)} 个重复项)"
             )
         
+        checkpoint_hash = EvaluationCache.hash_checkpoints(unique_checkpoints)
+        cache_key = self.eval_cache.build_key(
+            doc_hash=doc_hash,
+            checkpoints_hash=checkpoint_hash,
+            checkpoint_count=len(unique_checkpoints),
+            runs=1,
+            model_name=self.config.openai.model,
+            prompt_version=self.prompt_version,
+            baseline_fingerprint=None,
+            mode="single",
+        )
+        cached_entry = None
+        if enable_cache and cache_key:
+            cached_entry = self.eval_cache.load(cache_key)
+        if cached_entry and cached_entry.get("result"):
+            logger.info(f"命中评估缓存：{Path(target_document_path).name}（单评委）")
+            evaluation = self._deserialize_evaluation(cached_entry["result"])
+            evaluation.target_document = str(target_document_path)
+            return evaluation
+
         # 准备检查项TSV表格
         checkpoints_table = self._format_checkpoints_as_csv(unique_checkpoints)
         logger.debug(f"检查项数量: {len(unique_checkpoints)}, TSV长度: {len(checkpoints_table)} 字符")
@@ -1091,7 +1174,19 @@ class Evaluator:
                 # 如果之前有重试，记录成功信息
                 if parse_attempt > 0:
                     logger.info(f"解析重试成功（第 {parse_attempt + 1} 次尝试）")
-                
+                if enable_cache and cache_key:
+                    payload = {
+                        "doc_hash": doc_hash,
+                        "checkpoints_hash": checkpoint_hash,
+                        "checkpoint_count": len(unique_checkpoints),
+                        "runs": 1,
+                        "model": self.config.openai.model,
+                        "prompt_version": self.prompt_version,
+                        "baseline": "",
+                        "mode": "single",
+                        "result": self._serialize_evaluation(evaluation),
+                    }
+                    self.eval_cache.save(cache_key, payload)
                 return evaluation
                 
             except (ValueError, csv.Error) as e:
@@ -1153,13 +1248,44 @@ class Evaluator:
                 f"评估前去重检查项：由 {original_count} 条降至 {len(unique_checkpoints)} 条 "
                 f"(移除 {original_count - len(unique_checkpoints)} 个重复项)"
             )
+
+        target_content = self.parser.read_markdown(target_document_path)
+        doc_hash = EvaluationCache.hash_text(target_content)
+        checkpoint_hash = EvaluationCache.hash_checkpoints(unique_checkpoints)
+        baseline_fingerprint = str(baseline_document_path) if baseline_document_path else None
+        cache_key = self.eval_cache.build_key(
+            doc_hash=doc_hash,
+            checkpoints_hash=checkpoint_hash,
+            checkpoint_count=len(unique_checkpoints),
+            runs=runs,
+            model_name=self.config.openai.model,
+            prompt_version=self.prompt_version,
+            baseline_fingerprint=baseline_fingerprint,
+            mode="multi",
+        )
+        cached_entry = self.eval_cache.load(cache_key) if cache_key else None
+        if cached_entry and cached_entry.get("result"):
+            evaluation = self._deserialize_evaluation(cached_entry["result"])
+            evaluation.target_document = str(target_document_path)
+            evaluation.model_name = self.config.openai.model
+            if baseline_document_path:
+                evaluation.baseline_document = str(baseline_document_path)
+            evaluation.evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            evaluation.evaluation_duration = 0.0
+            logger.info(f"命中评估缓存：{Path(target_document_path).name}（评委 {runs}）")
+            return evaluation
         
         results = []
         
         # 串行执行多次评估
         for i in range(runs):
             try:
-                result = self.evaluate_single_run(unique_checkpoints, target_document_path)
+                result = self.evaluate_single_run(
+                    unique_checkpoints,
+                    target_document_path,
+                    target_content=target_content,
+                    enable_cache=False,
+                )
                 results.append(result)
                 logger.info(f"  [{i+1}/{runs}] 评委评估完成")
             except Exception as e:
@@ -1192,6 +1318,20 @@ class Evaluator:
         # 记录评估时间和耗时
         final_result.evaluation_time = evaluation_time
         final_result.evaluation_duration = time.time() - start_time
+
+        if cache_key:
+            payload = {
+                "doc_hash": doc_hash,
+                "checkpoints_hash": checkpoint_hash,
+                "checkpoint_count": len(unique_checkpoints),
+                "runs": runs,
+                "model": self.config.openai.model,
+                "prompt_version": self.prompt_version,
+                "baseline": baseline_fingerprint or "",
+                "mode": "multi",
+                "result": self._serialize_evaluation(final_result),
+            }
+            self.eval_cache.save(cache_key, payload)
 
         return final_result
 

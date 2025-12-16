@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../srs-gen"
+		},
+		{
+			"path": "../srs-gen2"
 		}
 	],
 	"settings": {}
