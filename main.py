@@ -122,7 +122,7 @@ def evaluate_single_document_with_stage(
         if judges > 1:
             evaluation = evaluator.evaluate_multiple_runs(
                 doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
-                enable_cache=not args.no_cache
+                enable_cache=not args.no_cache, min_judges_pass=args.min_judges_pass
             )
         else:
             start_time = time.time()
@@ -379,6 +379,12 @@ def main():
         help="评委数量，每次评估会运行指定次数，然后使用合并策略（如多数投票）合并结果。默认使用配置中的值",
     )
     parser.add_argument(
+        "--min-judges-pass",
+        type=int,
+        default=None,
+        help="判定通过的评委数要求（绝对数量）。例如：3个评委中需要2个通过才算通过。默认使用多数投票（超过50%）",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         choices=["json", "csv", "markdown", "all"],
@@ -462,6 +468,14 @@ def main():
 
     # 确定评委数量
     judges = args.judges if args.judges is not None else config.eval.default_runs
+    # 确定评委通过数阈值
+    min_judges_pass = args.min_judges_pass
+    # 验证 min_judges_pass 参数
+    if min_judges_pass is not None:
+        if min_judges_pass < 1:
+            parser.error("--min-judges-pass 必须大于等于 1")
+        if judges > 1 and min_judges_pass > judges:
+            parser.error(f"--min-judges-pass ({min_judges_pass}) 不能大于评委数量 ({judges})")
 
     # 确定基准文档或基准文档目录
     baseline_path = None
@@ -1221,7 +1235,7 @@ def main():
             if judges > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
                     doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
-                    enable_cache=not args.no_cache
+                    enable_cache=not args.no_cache, min_judges_pass=args.min_judges_pass
                 )
             else:
                 # 记录开始时间
@@ -1305,7 +1319,7 @@ def main():
                 if judges > 1:
                     evaluation = evaluator.evaluate_multiple_runs(
                         doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
-                        enable_cache=not args.no_cache
+                        enable_cache=not args.no_cache, min_judges_pass=args.min_judges_pass
                     )
                 else:
                     # 记录开始时间

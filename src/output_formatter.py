@@ -654,8 +654,9 @@ class OutputFormatter:
         # 如果有多个评委的结果，计算投票通过和平均通过
         if evaluation.all_judge_results and len(evaluation.all_judge_results) > 1:
             num_judges = len(evaluation.all_judge_results)
+            min_judges_pass = evaluation.min_judges_pass
             
-            # 计算多数投票统计（投票通过）
+            # 计算投票统计（投票通过）
             majority_passed_count = 0
             for index in range(total_checkpoints):
                 passed_votes = 0
@@ -663,8 +664,13 @@ class OutputFormatter:
                     if index < len(evaluation.all_judge_results[judge_idx]):
                         if evaluation.all_judge_results[judge_idx][index].passed:
                             passed_votes += 1
-                if passed_votes > (num_judges / 2):
-                    majority_passed_count += 1
+                # 投票逻辑：如果指定了 min_judges_pass，使用绝对数量；否则使用多数投票（超过50%）
+                if min_judges_pass is not None:
+                    if passed_votes >= min_judges_pass:
+                        majority_passed_count += 1
+                else:
+                    if passed_votes > (num_judges / 2):
+                        majority_passed_count += 1
             
             voting_score = (majority_passed_count / total_checkpoints) * 100 if total_checkpoints > 0 else 0.0
             

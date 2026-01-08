@@ -68,6 +68,7 @@ class DocumentEvaluation:
         all_judge_results: list[list[CheckpointResult]] | None = None,
         model_name: str | None = None,
         baseline_document: str | None = None,
+        min_judges_pass: int | None = None,
     ):
         self.target_document = target_document
         self.checkpoints = checkpoints
@@ -80,6 +81,7 @@ class DocumentEvaluation:
         self.baseline_document = baseline_document  # 基准文档路径
         self.evaluation_time: str | None = None  # 评估时间
         self.evaluation_duration: float | None = None  # 评估耗时（秒）
+        self.min_judges_pass: int | None = min_judges_pass  # 判定通过的评委数要求
 
 
 class Evaluator:
@@ -136,6 +138,8 @@ class Evaluator:
                 [self._serialize_checkpoint_result(cp) for cp in judge_results]
                 for judge_results in evaluation.all_judge_results
             ]
+        if evaluation.min_judges_pass is not None:
+            payload["min_judges_pass"] = evaluation.min_judges_pass
         return payload
 
     def _deserialize_evaluation(self, data: dict[str, Any]) -> DocumentEvaluation:
@@ -155,6 +159,7 @@ class Evaluator:
             checkpoints=data.get("checkpoints", []),
             checkpoint_results=checkpoint_results,
             all_judge_results=all_judge_results,
+            min_judges_pass=data.get("min_judges_pass"),
         )
         return evaluation
 
@@ -1225,6 +1230,7 @@ class Evaluator:
         runs: int = 3,
         baseline_document_path: str | Path | None = None,
         enable_cache: bool = True,
+        min_judges_pass: int | None = None,
     ) -> DocumentEvaluation:
         """
         多次运行评估并合并结果（串行执行）
@@ -1315,6 +1321,7 @@ class Evaluator:
             results,
             unique_checkpoints,
             target_document_path,
+            min_judges_pass=min_judges_pass,
         )
 
         # 保存评估元信息
@@ -1348,6 +1355,7 @@ class Evaluator:
         raw_results: list[DocumentEvaluation],
         checkpoints: list[str],
         target_document_path: str | Path,
+        min_judges_pass: int | None = None,
     ) -> DocumentEvaluation:
         """
         检查项级别投票策略：先对每个检查项进行多数投票，得到合并后的检查项结果，然后基于合并结果计算维度得分
@@ -1394,8 +1402,11 @@ class Evaluator:
                 "total_count": runs,
             })
             
-            # 多数投票：超过50%认为通过则通过
-            passed = votes["passed_count"] > (runs / 2)
+            # 投票逻辑：如果指定了 min_judges_pass，使用绝对数量；否则使用多数投票（超过50%）
+            if min_judges_pass is not None:
+                passed = votes["passed_count"] >= min_judges_pass
+            else:
+                passed = votes["passed_count"] > (runs / 2)
             pass_rate = votes["passed_count"] / runs if runs > 0 else 0.0
             category, content = split_checkpoint_category(checkpoint)
             
@@ -1416,6 +1427,7 @@ class Evaluator:
             checkpoints=checkpoints,
             checkpoint_results=merged_checkpoint_results,
             all_judge_results=all_judge_results,
+            min_judges_pass=min_judges_pass,
         )
         
         return final_result
