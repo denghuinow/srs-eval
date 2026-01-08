@@ -121,12 +121,13 @@ def evaluate_single_document_with_stage(
         
         if judges > 1:
             evaluation = evaluator.evaluate_multiple_runs(
-                doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
+                doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
+                enable_cache=not args.no_cache
             )
         else:
             start_time = time.time()
             evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
+            evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path, enable_cache=not args.no_cache)
             evaluation.model_name = config.openai.model
             evaluation.baseline_document = str(doc_baseline_path)
             evaluation.evaluation_time = evaluation_time
@@ -428,6 +429,11 @@ def main():
         type=str,
         nargs="+",
         help="强制重新评估指定的文档（即使已存在评估结果，也会重新评估）。可以指定文档名称（不含扩展名）或完整路径",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="强制重新调用模型并覆盖评估缓存（不使用已缓存的评估结果，会删除并重新生成缓存）",
     )
 
     args = parser.parse_args()
@@ -1214,14 +1220,15 @@ def main():
             
             if judges > 1:
                 evaluation = evaluator.evaluate_multiple_runs(
-                    doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
+                    doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
+                    enable_cache=not args.no_cache
                 )
             else:
                 # 记录开始时间
                 start_time = time.time()
                 evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
+                evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path, enable_cache=not args.no_cache)
                 # 为单次评估也添加元信息
                 evaluation.model_name = config.openai.model
                 evaluation.baseline_document = str(doc_baseline_path)
@@ -1297,14 +1304,15 @@ def main():
             try:
                 if judges > 1:
                     evaluation = evaluator.evaluate_multiple_runs(
-                        doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path
+                        doc_checkpoints, target_path, runs=judges, baseline_document_path=doc_baseline_path,
+                        enable_cache=not args.no_cache
                     )
                 else:
                     # 记录开始时间
                     start_time = time.time()
                     evaluation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path)
+                    evaluation = evaluator.evaluate_single_run(doc_checkpoints, target_path, enable_cache=not args.no_cache)
                     # 为单次评估也添加元信息
                     evaluation.model_name = config.openai.model
                     evaluation.baseline_document = str(doc_baseline_path)

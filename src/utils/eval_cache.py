@@ -85,3 +85,13 @@ class EvaluationCache:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         tmp_path.replace(path)
+
+    def delete(self, key: str) -> None:
+        """删除指定的缓存文件"""
+
+        path = self._cache_path(key)
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass  # 忽略删除失败的情况

@@ -982,6 +982,9 @@ class Evaluator:
             baseline_fingerprint=None,
             mode="single",
         )
+        # 如果禁用缓存，先删除已存在的缓存文件
+        if not enable_cache and cache_key:
+            self.eval_cache.delete(cache_key)
         cached_entry = None
         if enable_cache and cache_key:
             cached_entry = self.eval_cache.load(cache_key)
@@ -1221,6 +1224,7 @@ class Evaluator:
         target_document_path: str | Path,
         runs: int = 3,
         baseline_document_path: str | Path | None = None,
+        enable_cache: bool = True,
     ) -> DocumentEvaluation:
         """
         多次运行评估并合并结果（串行执行）
@@ -1263,7 +1267,10 @@ class Evaluator:
             baseline_fingerprint=baseline_fingerprint,
             mode="multi",
         )
-        cached_entry = self.eval_cache.load(cache_key) if cache_key else None
+        # 如果禁用缓存，先删除已存在的缓存文件
+        if not enable_cache and cache_key:
+            self.eval_cache.delete(cache_key)
+        cached_entry = self.eval_cache.load(cache_key) if enable_cache and cache_key else None
         if cached_entry and cached_entry.get("result"):
             evaluation = self._deserialize_evaluation(cached_entry["result"])
             evaluation.target_document = str(target_document_path)
@@ -1319,7 +1326,8 @@ class Evaluator:
         final_result.evaluation_time = evaluation_time
         final_result.evaluation_duration = time.time() - start_time
 
-        if cache_key:
+        # 只有在启用缓存时才保存
+        if enable_cache and cache_key:
             payload = {
                 "doc_hash": doc_hash,
                 "checkpoints_hash": checkpoint_hash,
